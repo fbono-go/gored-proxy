@@ -20,26 +20,23 @@ app.all('/api/v1/*', async (req, res) => {
     const path = req.path;
     const query = Object.keys(req.query).length ? '?' + new URLSearchParams(req.query).toString() : '';
     const url = ZAMMAD_URL + path + query;
-
     console.log('Proxying:', req.method, url);
 
-    const options = {
-      method: req.method,
-      headers: {
-        'Authorization': 'Token token=' + ZAMMAD_TOKEN,
-        'Content-Type': 'application/json',
-        'Accept': 'application/json'
-      }
+    const headers = {
+      'Authorization': 'Token token=' + ZAMMAD_TOKEN,
+      'Content-Type': 'application/json',
+      'Accept': 'application/json',
+      'X-Requested-With': 'XMLHttpRequest'
     };
 
+    const options = { method: req.method, headers };
     if (['POST', 'PUT', 'PATCH'].includes(req.method) && req.body) {
       options.body = JSON.stringify(req.body);
     }
 
     const response = await fetch(url, options);
     const text = await response.text();
-
-    console.log('Response status:', response.status);
+    console.log('Status:', response.status);
 
     let data;
     try { data = JSON.parse(text); }
@@ -47,12 +44,12 @@ app.all('/api/v1/*', async (req, res) => {
 
     res.status(response.status).json(data);
   } catch (e) {
-    console.error('Proxy error:', e);
+    console.error('Error:', e);
     res.status(500).json({ error: e.message });
   }
 });
 
-app.get('/', (req, res) => res.send('Proxy GoRed funcionando OK'));
+app.get('/', (req, res) => res.send('Proxy GoRed OK'));
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log('Servidor corriendo en puerto ' + PORT));
+app.listen(PORT, () => console.log('Servidor en puerto ' + PORT));
