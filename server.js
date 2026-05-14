@@ -3,7 +3,7 @@ const fetch = require('node-fetch');
 const app = express();
 
 const ZAMMAD_URL = 'https://help.gored.com.ar';
-const ZAMMAD_TOKEN = 'd_YMNiEfhw-aw_61Pm2O6cRDTO6AeI8-mo5tqBTjvjzaRIxUXMXu31HAr2fEIt5z';
+const ZAMMAD_TOKEN = 'VsEhIeRS8p3oFIdq4XXePBe3RXLiLRBn2d9Ysrzuofw_tE1YPvCCQY8ywUQGwAvh';
 
 app.use(express.json());
 
