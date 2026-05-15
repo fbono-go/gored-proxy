@@ -15,10 +15,9 @@ app.use((req, res, next) => {
   next();
 });
 
-// Mis tickets: owner=Franco Bono Referente, estado nuevo o abierto
 app.get('/my_open_tickets', async (req, res) => {
   try {
-    const query = encodeURIComponent('owner:"Franco Bono Referente" AND (state:new OR state:open)');
+    const query = encodeURIComponent('owner_id:321 AND (state_id:1 OR state_id:2)');
     const url = `${ZAMMAD_URL}/api/v1/tickets/search?query=${query}&page=1&per_page=100&sort_by=created_at&order_by=desc&expand=true`;
     console.log('Buscando:', url);
     const r = await fetch(url, {
@@ -28,7 +27,7 @@ app.get('/my_open_tickets', async (req, res) => {
       }
     });
     const data = await r.json();
-    console.log('Respuesta search:', JSON.stringify(data).substring(0, 200));
+    console.log('Resultado:', JSON.stringify(data).substring(0, 300));
     res.json(data);
   } catch(e) {
     console.error(e);
