@@ -15,10 +15,10 @@ app.use((req, res, next) => {
   next();
 });
 
-// Mis tickets: owner=Franco Bono, estado nuevo o abierto
+// Mis tickets: owner=Franco Bono Referente, estado nuevo o abierto
 app.get('/my_open_tickets', async (req, res) => {
   try {
-    const query = encodeURIComponent('owner:"Franco Bono" AND (state:new OR state:open)');
+    const query = encodeURIComponent('owner:"Franco Bono Referente" AND (state:new OR state:open)');
     const url = `${ZAMMAD_URL}/api/v1/tickets/search?query=${query}&page=1&per_page=100&sort_by=created_at&order_by=desc&expand=true`;
     console.log('Buscando:', url);
     const r = await fetch(url, {
