@@ -1,3 +1,6 @@
+
+Copiar
+
 const express = require('express');
 const fetch = require('node-fetch');
 const app = express();
@@ -14,7 +17,7 @@ app.use((req, res, next) => {
   next();
 });
  
-// Mis tickets - devuelve array directo
+// Mis tickets
 app.get('/my_open_tickets', async (req, res) => {
   try {
     const query = encodeURIComponent('owner_id:321 AND (state_id:1 OR state_id:2)');
@@ -24,16 +27,18 @@ app.get('/my_open_tickets', async (req, res) => {
     });
     const data = await r.json();
     
-    // Extraer tickets del response
+    // Zammad devuelve: {tickets: [id1, id2...], assets: {Ticket: {id1: {objeto}, id2: {objeto}}}}
     let tickets = [];
-    if (Array.isArray(data)) {
+    if (data.assets && data.assets.Ticket) {
+      // Convertir objeto de assets a array
+      tickets = Object.values(data.assets.Ticket);
+    } else if (Array.isArray(data)) {
       tickets = data;
     } else if (data.tickets && Array.isArray(data.tickets)) {
       tickets = data.tickets;
-    } else if (data.assets && data.assets.Ticket) {
-      tickets = Object.values(data.assets.Ticket);
     }
     
+    console.log('my_open_tickets:', tickets.length, 'tickets');
     res.json(tickets);
   } catch(e) {
     console.error('Error /my_open_tickets:', e);
@@ -41,7 +46,7 @@ app.get('/my_open_tickets', async (req, res) => {
   }
 });
  
-// Tickets de oficial - devuelve array directo
+// Tickets de oficial
 app.get('/oficial_tickets/:id', async (req, res) => {
   try {
     const oid = req.params.id;
@@ -52,16 +57,18 @@ app.get('/oficial_tickets/:id', async (req, res) => {
     });
     const data = await r.json();
     
-    // Extraer tickets del response
+    // Zammad devuelve: {tickets: [id1, id2...], assets: {Ticket: {id1: {objeto}, id2: {objeto}}}}
     let tickets = [];
-    if (Array.isArray(data)) {
+    if (data.assets && data.assets.Ticket) {
+      // Convertir objeto de assets a array
+      tickets = Object.values(data.assets.Ticket);
+    } else if (Array.isArray(data)) {
       tickets = data;
     } else if (data.tickets && Array.isArray(data.tickets)) {
       tickets = data.tickets;
-    } else if (data.assets && data.assets.Ticket) {
-      tickets = Object.values(data.assets.Ticket);
     }
     
+    console.log('oficial_tickets/' + oid + ':', tickets.length, 'tickets');
     res.json(tickets);
   } catch(e) {
     console.error('Error /oficial_tickets/' + req.params.id, e);
@@ -105,3 +112,4 @@ app.get('/', (req, res) => res.send('Proxy GoRed OK'));
  
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log('Proxy escuchando en puerto ' + PORT));
+ 
