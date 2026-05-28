@@ -96,22 +96,22 @@ app.get('/api/reporte', async (req, res) => {
       else if (t.priority_id === 7) prioridades.Baja++;
     }
 
-    // 4. SECTOR B (responsible_area:2) - vencidos vs en tiempo (abiertos, no cerrados)
-    const sectorBRes = await searchWithAssets('responsible_area:2 AND (state_id:1 OR state_id:2)', 500);
+    // 4. SECTOR B (los 3 oficiales) - vencidos vs en tiempo (abiertos, no cerrados)
+    const sectorBRes = await searchWithAssets('(owner_id:67 OR owner_id:66 OR owner_id:68) AND (state_id:1 OR state_id:2)', 500);
     const sectorBOpen = sectorBRes.tickets;
     const ahora = new Date();
     const vencidos = sectorBOpen.filter(t => t.escalation_at && new Date(t.escalation_at) < ahora).length;
     const enTiempo = sectorBOpen.length - vencidos;
 
-    // 5. EVOLUCIÓN SEMANAL de cerrados en SECTOR B
+    // 5. EVOLUCIÓN SEMANAL de cerrados en SECTOR B (los 3 oficiales)
     const semanas = [];
     for (let i=3; i>=0; i--) {
       const ini = new Date(Date.now() - (i+1)*7*24*3600*1000);
       const fin = new Date(Date.now() - i*7*24*3600*1000);
       semanas.push({ ini, fin, label: `Sem ${4-i}` });
     }
-    // Buscar cerrados de sector B (responsible_area:2, state_id:4, close_at >= desde)
-    const sectorBCerradosRes = await searchWithAssets('responsible_area:2 AND state_id:4 AND close_at:>'+desdeIso, 500);
+    // Buscar cerrados de sector B (3 oficiales, state_id:4, close_at >= desde)
+    const sectorBCerradosRes = await searchWithAssets('(owner_id:67 OR owner_id:66 OR owner_id:68) AND state_id:4 AND close_at:>'+desdeIso, 500);
     const sectorBCerrados = sectorBCerradosRes.tickets;
     const evolSemanasCerrados = semanas.map(s => sectorBCerrados.filter(t =>
       t.close_at && new Date(t.close_at) >= s.ini && new Date(t.close_at) < s.fin).length);
