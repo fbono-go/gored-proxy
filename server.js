@@ -12,6 +12,9 @@ const OFICIALES = [
   { id: 66, name: 'Carlos Carranza', color: '#f5a623' },
   { id: 68, name: 'Fausto Casco', color: '#9b59f6' }
 ];
+// Prioridades Zammad (custom GOred): 5=Vital, 2=Alta, 6=Media, 7=Baja
+const PRIO_LABELS = { 5:'Vital', 2:'Alta', 6:'Media', 7:'Baja' };
+const ALTA_COMPLEJIDAD = [5, 2]; // Vital + Alta
 
 app.use(compression());
 app.use(express.json());
@@ -23,13 +26,18 @@ app.use((req, res, next) => {
   next();
 });
 
+// Devuelve SOLO los tickets que realmente matchean (usando el array de IDs),
+// más el conteo total real (tickets_count) y los usuarios referenciados.
 async function searchWithAssets(query, perPage=200) {
   const url = `${ZAMMAD_URL}/api/v1/tickets/search?query=${encodeURIComponent(query)}&page=1&per_page=${perPage}`;
   const r = await fetch(url, { headers: HEADERS });
   const data = await r.json();
-  const tickets = (data.assets && data.assets.Ticket) ? Object.values(data.assets.Ticket) : [];
+  const assetTickets = (data.assets && data.assets.Ticket) ? data.assets.Ticket : {};
+  const ids = Array.isArray(data.tickets) ? data.tickets : [];
+  const tickets = ids.map(id => assetTickets[id]).filter(Boolean);
   const users = (data.assets && data.assets.User) ? data.assets.User : {};
-  return { tickets, users };
+  const count = (typeof data.tickets_count === 'number') ? data.tickets_count : tickets.length;
+  return { tickets, users, count };
 }
 
 function extraerDescripcion(body) {
@@ -48,7 +56,7 @@ async function fetchDescripcion(articleId) {
   } catch (e) { return ''; }
 }
 
-// ── /api/dashboard (sin cambios) ────────────────────────
+// ── /api/dashboard ──────────────────────────────────────
 app.get('/api/dashboard', async (req, res) => {
   try {
     const qs = ['owner_id:321 AND (state_id:1 OR state_id:2)', 'owner_id:67 AND (state_id:1 OR state_id:2)', 'owner_id:66 AND (state_id:1 OR state_id:2)', 'owner_id:68 AND (state_id:1 OR state_id:2)', 'owner_id:76 AND (state_id:1 OR state_id:2)'];
@@ -75,48 +83,39 @@ app.get('/api/reporte', async (req, res) => {
     const desde = new Date(Date.now() - days*24*3600*1000);
     const desdeIso = desde.toISOString().slice(0,10);
 
-    // 1. TOTAL NUEVOS en el período (state_id:1, created_at >= desde)
-    const nuevosRes = await searchWithAssets(`state_id:1 AND created_at:>${desdeIso}`, 500);
-    const totalNuevos = nuevosRes.tickets.length;
+    // TODAS las búsquedas en paralelo (1 sola tanda)
+    const [
+      nuevosRes,
+      eliosCer, carlosCer, faustoCer,
+      eliosAb, carlosAb, faustoAb
+    ] = await Promise.all([
+      searchWithAssets(`group_id:2 AND created_at:>${desdeIso}`, 1),                    // solo necesito el count
+      searchWithAssets(`owner_id:67 AND state_id:4 AND close_at:>${desdeIso}`, 400),
+      searchWithAssets(`owner_id:66 AND state_id:4 AND close_at:>${desdeIso}`, 400),
+      searchWithAssets(`owner_id:68 AND state_id:4 AND close_at:>${desdeIso}`, 400),
+      searchWithAssets(`owner_id:67 AND (state_id:1 OR state_id:2)`, 400),
+      searchWithAssets(`owner_id:66 AND (state_id:1 OR state_id:2)`, 400),
+      searchWithAssets(`owner_id:68 AND (state_id:1 OR state_id:2)`, 400)
+    ]);
 
-    // 2. CERRADOS por cada oficial en el período (state_id:4, close_at >= desde)
-    const cerradosPorOficial = {};
-    for (const of of OFICIALES) {
-      const res = await searchWithAssets(`owner_id:${of.id} AND state_id:4 AND close_at:>${desdeIso}`, 200);
-      cerradosPorOficial[of.id] = res.tickets;
-    }
+    const totalNuevos = nuevosRes.count;
+    const cerradosPorOficial = { 67: eliosCer.tickets, 66: carlosCer.tickets, 68: faustoCer.tickets };
+    const sectorBCerrados = [...eliosCer.tickets, ...carlosCer.tickets, ...faustoCer.tickets];
+    const sectorBOpen = [...eliosAb.tickets, ...carlosAb.tickets, ...faustoAb.tickets];
 
-    // 3. PRIORIDADES de los cerrados (de los 3 oficiales)
-    const allCerrados = [...cerradosPorOficial[67], ...cerradosPorOficial[66], ...cerradosPorOficial[68]];
+    // Prioridades de los cerrados (3 oficiales)
     const prioridades = { Vital: 0, Alta: 0, Media: 0, Baja: 0 };
-    for (const t of allCerrados) {
-      if (t.priority_id === 5) prioridades.Vital++;
-      else if (t.priority_id === 2) prioridades.Alta++;
-      else if (t.priority_id === 6) prioridades.Media++;
-      else if (t.priority_id === 7) prioridades.Baja++;
+    for (const t of sectorBCerrados) {
+      const lbl = PRIO_LABELS[t.priority_id];
+      if (lbl) prioridades[lbl]++;
     }
 
-    // 4. SECTOR B (los 3 oficiales) - vencidos vs en tiempo (abiertos, no cerrados)
-    const sectorBRes = await searchWithAssets('(owner_id:67 OR owner_id:66 OR owner_id:68) AND (state_id:1 OR state_id:2)', 500);
-    const sectorBOpen = sectorBRes.tickets;
+    // Vencidos vs en tiempo (abiertos sector B)
     const ahora = new Date();
     const vencidos = sectorBOpen.filter(t => t.escalation_at && new Date(t.escalation_at) < ahora).length;
     const enTiempo = sectorBOpen.length - vencidos;
 
-    // 5. EVOLUCIÓN SEMANAL de cerrados en SECTOR B (los 3 oficiales)
-    const semanas = [];
-    for (let i=3; i>=0; i--) {
-      const ini = new Date(Date.now() - (i+1)*7*24*3600*1000);
-      const fin = new Date(Date.now() - i*7*24*3600*1000);
-      semanas.push({ ini, fin, label: `Sem ${4-i}` });
-    }
-    // Buscar cerrados de sector B (3 oficiales, state_id:4, close_at >= desde)
-    const sectorBCerradosRes = await searchWithAssets('(owner_id:67 OR owner_id:66 OR owner_id:68) AND state_id:4 AND close_at:>'+desdeIso, 500);
-    const sectorBCerrados = sectorBCerradosRes.tickets;
-    const evolSemanasCerrados = semanas.map(s => sectorBCerrados.filter(t =>
-      t.close_at && new Date(t.close_at) >= s.ini && new Date(t.close_at) < s.fin).length);
-
-    // 6. TARJETAS POR OFICIAL - franjas horarias de cierre
+    // Helpers
     const horas = t => {
       if (!t.close_at || !t.created_at) return null;
       return (new Date(t.close_at) - new Date(t.created_at)) / 3600000;
@@ -139,36 +138,42 @@ app.get('/api/reporte', async (req, res) => {
       return { counts: f, pct: f.map(c => Math.round(c/tot*100)) };
     };
 
+    // Tarjetas por oficial
     const oficiales = OFICIALES.map(of => {
-      const tk = cerradosPorOficial[of.id];
+      const tk = cerradosPorOficial[of.id] || [];
       const hs = tk.map(horas).filter(h => h !== null && h >= 0);
       const fr = franjas(hs);
       const prom = hs.length ? hs.reduce((a,b)=>a+b,0)/hs.length : 0;
-      const med = mediana(hs);
-      const alta = tk.filter(t => t.priority_id >= 5).length;
+      const alta = tk.filter(t => ALTA_COMPLEJIDAD.includes(t.priority_id)).length;
       return {
         id: of.id, name: of.name, color: of.color,
         total: tk.length,
         promedio_hs: +prom.toFixed(1),
-        mediana_hs: +med.toFixed(1),
+        mediana_hs: +mediana(hs).toFixed(1),
         franjas: fr.counts,
         franjas_pct: fr.pct,
         pct_alta_compl: tk.length ? Math.round(alta/tk.length*100) : 0
       };
     });
 
-    // 7. EVOLUCIÓN DE TIEMPO DE CIERRE por semana (sector B cerrados)
-    const evolSemanasTiempo = semanas.map(s => {
-      const tk = sectorBCerrados.filter(t =>
-        t.close_at && new Date(t.close_at) >= s.ini && new Date(t.close_at) < s.fin);
+    // Evolución semanal (últimas 4 semanas)
+    const semanas = [];
+    for (let i=3; i>=0; i--) {
+      const ini = new Date(Date.now() - (i+1)*7*24*3600*1000);
+      const fin = new Date(Date.now() - i*7*24*3600*1000);
+      semanas.push({ ini, fin, label: `Sem ${4-i}` });
+    }
+    const evolucionCerrados = semanas.map(s => sectorBCerrados.filter(t =>
+      t.close_at && new Date(t.close_at) >= s.ini && new Date(t.close_at) < s.fin).length);
+    const evolucionTiempo = semanas.map(s => {
+      const tk = sectorBCerrados.filter(t => t.close_at && new Date(t.close_at) >= s.ini && new Date(t.close_at) < s.fin);
       const hs = tk.map(horas).filter(h => h !== null && h >= 0);
       return hs.length ? +(hs.reduce((a,b)=>a+b,0)/hs.length).toFixed(1) : 0;
     });
 
-    // 8. TIEMPO POR PRIORIDAD Y OFICIAL (sector B cerrados)
-    const PRIO_LABELS = { 5:'Vital', 2:'Alta', 6:'Media', 7:'Baja' };
+    // Tiempo por prioridad y oficial
     const tiempoPorPrioridad = OFICIALES.map(of => {
-      const tk = sectorBCerrados.filter(t => t.owner_id === of.id);
+      const tk = cerradosPorOficial[of.id] || [];
       const porPrio = {};
       for (const pid of [5,2,6,7]) {
         const sub = tk.filter(t => t.priority_id === pid).map(horas).filter(h => h !== null && h >= 0);
@@ -190,8 +195,8 @@ app.get('/api/reporte', async (req, res) => {
       sector_b: { vencidos, en_tiempo: enTiempo },
       oficiales,
       evolucion_semanas: semanas.map(s => s.label),
-      evolucion_cerrados: evolSemanasCerrados,
-      evolucion_tiempo_hs: evolSemanasTiempo,
+      evolucion_cerrados: evolucionCerrados,
+      evolucion_tiempo_hs: evolucionTiempo,
       tiempo_por_prioridad: tiempoPorPrioridad
     });
   } catch (e) { console.error(e); res.status(500).json({ error: e.message }); }
