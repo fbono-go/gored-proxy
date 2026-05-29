@@ -63,23 +63,28 @@ function extraerDescripcion(body) {
     .replace(/&lt;/g, '<').replace(/&gt;/g, '>')
     .replace(/&quot;/g, '"').replace(/&#39;/g, "'")
     .replace(/&amp;/g, '&');
-  // Remover todo HTML
+  // Remover scripts y estilos completos
   body = body
     .replace(/<script[^>]*>.*?<\/script>/gi, '')
-    .replace(/<style[^>]*>.*?<\/style>/gi, '')
-    .replace(/<[^>]+>/g, ' ');
-  // Limpiar espacios múltiples y saltos
+    .replace(/<style[^>]*>.*?<\/style>/gi, '');
+  // Reemplazar bloques con salto de línea para preservar estructura
   body = body
-    .replace(/\s+/g, ' ')
-    .trim();
-  
-  // Validar: si es solo números/caracteres especiales o muy corto, es inválido
-  const onlyNumbers = /^\d+$/.test(body);
-  if (onlyNumbers || body.length < 5) return '';
-  
-  // Limitar a 500 caracteres
-  if (body.length > 500) body = body.substring(0, 500) + '...';
-  return body || '';
+    .replace(/<br\s*\/?>/gi, '\n')
+    .replace(/<\/p>/gi, '\n')
+    .replace(/<\/div>/gi, '\n')
+    .replace(/<\/li>/gi, '\n');
+  // Remover tags restantes
+  body = body.replace(/<[^>]+>/g, '');
+  // Decodificar entidades restantes
+  body = body.replace(/&nbsp;/g, ' ').replace(/&#\d+;/g, ' ');
+  // Limpiar líneas vacías y espacios
+  body = body.split('\n')
+    .map(l => l.trim())
+    .filter(l => l.length > 0)
+    .join('\n');
+  // Limitar a 600 caracteres
+  if (body.length > 600) body = body.substring(0, 600) + '...';
+  return body.trim();
 }
 
 
