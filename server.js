@@ -1,12 +1,28 @@
 const express = require('express');
 const compression = require('compression');
 const app = express();
-
+ 
 const ZAMMAD_URL = 'https://help.gored.com.ar';
 const TOKEN = 'VsEhIeRS8p3oFIdq4XXePBe3RXLiLRBn2d9Ysrzuofw_tE1YPvCCQY8ywUQGwAvh';
 const HEADERS = { 'Authorization': 'Token token=' + TOKEN, 'Content-Type': 'application/json' };
-
-const OWNERS = { 321: 'Franco Bono', 67: 'Elio Molina', 66: 'Carlos Carranza', 68: 'Fausto Casco', 76: 'UVR Proveedor' };
+ 
+const OWNERS = {
+  // Referentes
+  321:'Franco Bono', 61:'Juan Pablo Pioli', 40:'Simon Villavicencio',
+  59:'Soledad Del Cerro', 60:'Andrés Haugh', 62:'Mariana Serrano Oar', 41:'Pedidos Grupo Oroño',
+  // Oficiales
+  67:'Elio Molina', 66:'Carlos Carranza', 68:'Fausto Casco', 64:'Agustín Gentiletti',
+  65:'Damián Benítez', 69:'Claudio Rojas', 70:'Ramón Carballo', 71:'Gabriel Moreno',
+  72:'Néstor Bacaro', 74:'Gutierrez Elias', 75:'Gustavo Salinas', 77:'Rodrigo Buitron',
+  79:'Emiliano Godoy', 141:'Martin Galuppo', 245:'Brandon Villalba',
+  // Proveedores
+  76:'UVR', 81:'Texon', 82:'Pampa', 83:'Taquias', 84:'Jhava', 215:'Alan Ojeda',
+  216:'Sergio Brochi', 219:'Gabriel Donet', 220:'Antonio Brun', 221:'Sebastián Lapelle',
+  222:'Sergio Lapelle', 223:'Cerrajeria Bono', 224:'Leo Di Lucca', 225:'Fumival',
+  227:'Office Amoblamiento', 229:'Luciano Prisma', 237:'Fumipla', 238:'Edgardo Islas',
+  239:'Diaz SRL', 257:'Mola climatizacion', 267:'Koll Muebles', 269:'ENTER Portones',
+  270:'Sergio Gulin', 271:'Plus Cortinas'
+};
 const OFICIALES = [
   { id: 67, name: 'Elio Molina', color: '#e0533d' },
   { id: 66, name: 'Carlos Carranza', color: '#f5a623' },
@@ -15,7 +31,7 @@ const OFICIALES = [
 // Prioridades Zammad (custom GOred): 5=Vital, 2=Alta, 6=Media, 7=Baja
 const PRIO_LABELS = { 5:'Vital', 2:'Alta', 6:'Media', 7:'Baja' };
 const ALTA_COMPLEJIDAD = [5, 2]; // Vital + Alta
-
+ 
 app.use(compression());
 app.use(express.json());
 app.use((req, res, next) => {
@@ -25,7 +41,7 @@ app.use((req, res, next) => {
   if (req.method === 'OPTIONS') return res.sendStatus(200);
   next();
 });
-
+ 
 // Devuelve SOLO los tickets que realmente matchean (usando el array de IDs),
 // más el conteo total real (tickets_count) y los usuarios referenciados.
 async function searchWithAssets(query, perPage=200) {
@@ -39,7 +55,7 @@ async function searchWithAssets(query, perPage=200) {
   const count = (typeof data.tickets_count === 'number') ? data.tickets_count : tickets.length;
   return { tickets, users, count };
 }
-
+ 
 function extraerDescripcion(body) {
   if (!body) return '';
   const lines = body.split('\n').filter(l => l.trim());
@@ -55,12 +71,23 @@ async function fetchDescripcion(articleId) {
     return extraerDescripcion(a.body);
   } catch (e) { return ''; }
 }
-
-// ── /api/dashboard ──────────────────────────────────────
+ 
+// ── /api/dashboard?owner_id=321&destinos=67,66,68,76 ────
 app.get('/api/dashboard', async (req, res) => {
   try {
-    const qs = ['owner_id:321 AND (state_id:1 OR state_id:2)', 'owner_id:67 AND (state_id:1 OR state_id:2)', 'owner_id:66 AND (state_id:1 OR state_id:2)', 'owner_id:68 AND (state_id:1 OR state_id:2)', 'owner_id:76 AND (state_id:1 OR state_id:2)'];
-    const resultados = await Promise.all(qs.map(q => searchWithAssets(q, 100)));
+    // owner_id del referente que usa la app (default: Franco 321)
+    const ownerId = parseInt(req.query.owner_id) || 321;
+    // destinos a los que deriva (default: Elio, Carlos, Fausto, UVR)
+    let destinos = [67, 66, 68, 76];
+    if (req.query.destinos) {
+      const parsed = req.query.destinos.split(',').map(x => parseInt(x.trim())).filter(Boolean);
+      if (parsed.length) destinos = parsed;
+    }
+    // Lista de owners a consultar: el referente + sus destinos (sin duplicados)
+    const owners = [...new Set([ownerId, ...destinos])];
+    const qs = owners.map(id => `owner_id:${id} AND (state_id:1 OR state_id:2)`);
+ 
+    const resultados = await Promise.all(qs.map(q => searchWithAssets(q, 200)));
     const allUsers = {}; resultados.forEach(r => Object.assign(allUsers, r.users));
     const seen = new Set(); const tickets = [];
     for (const r of resultados) for (const t of r.tickets) if (!seen.has(t.id)) { seen.add(t.id); tickets.push(t); }
@@ -75,14 +102,14 @@ app.get('/api/dashboard', async (req, res) => {
     res.json({ tickets, total: tickets.length });
   } catch (e) { console.error(e); res.status(500).json({ error: e.message }); }
 });
-
+ 
 // ── /api/reporte?days=30 ────────────────────────────────
 app.get('/api/reporte', async (req, res) => {
   try {
     const days = parseInt(req.query.days || '30');
     const desde = new Date(Date.now() - days*24*3600*1000);
     const desdeIso = desde.toISOString().slice(0,10);
-
+ 
     // TODAS las búsquedas en paralelo (1 sola tanda)
     const [
       nuevosRes,
@@ -97,24 +124,24 @@ app.get('/api/reporte', async (req, res) => {
       searchWithAssets(`owner_id:66 AND (state_id:1 OR state_id:2)`, 400),
       searchWithAssets(`owner_id:68 AND (state_id:1 OR state_id:2)`, 400)
     ]);
-
+ 
     const totalNuevos = nuevosRes.count;
     const cerradosPorOficial = { 67: eliosCer.tickets, 66: carlosCer.tickets, 68: faustoCer.tickets };
     const sectorBCerrados = [...eliosCer.tickets, ...carlosCer.tickets, ...faustoCer.tickets];
     const sectorBOpen = [...eliosAb.tickets, ...carlosAb.tickets, ...faustoAb.tickets];
-
+ 
     // Prioridades de los cerrados (3 oficiales)
     const prioridades = { Vital: 0, Alta: 0, Media: 0, Baja: 0 };
     for (const t of sectorBCerrados) {
       const lbl = PRIO_LABELS[t.priority_id];
       if (lbl) prioridades[lbl]++;
     }
-
+ 
     // Vencidos vs en tiempo (abiertos sector B)
     const ahora = new Date();
     const vencidos = sectorBOpen.filter(t => t.escalation_at && new Date(t.escalation_at) < ahora).length;
     const enTiempo = sectorBOpen.length - vencidos;
-
+ 
     // Helpers
     const horas = t => {
       if (!t.close_at || !t.created_at) return null;
@@ -137,7 +164,7 @@ app.get('/api/reporte', async (req, res) => {
       const tot = arr.length || 1;
       return { counts: f, pct: f.map(c => Math.round(c/tot*100)) };
     };
-
+ 
     // Tarjetas por oficial
     const oficiales = OFICIALES.map(of => {
       const tk = cerradosPorOficial[of.id] || [];
@@ -155,7 +182,7 @@ app.get('/api/reporte', async (req, res) => {
         pct_alta_compl: tk.length ? Math.round(alta/tk.length*100) : 0
       };
     });
-
+ 
     // Evolución semanal (últimas 4 semanas)
     const semanas = [];
     for (let i=3; i>=0; i--) {
@@ -170,7 +197,7 @@ app.get('/api/reporte', async (req, res) => {
       const hs = tk.map(horas).filter(h => h !== null && h >= 0);
       return hs.length ? +(hs.reduce((a,b)=>a+b,0)/hs.length).toFixed(1) : 0;
     });
-
+ 
     // Tiempo por prioridad y oficial
     const tiempoPorPrioridad = OFICIALES.map(of => {
       const tk = cerradosPorOficial[of.id] || [];
@@ -181,7 +208,7 @@ app.get('/api/reporte', async (req, res) => {
       }
       return { id: of.id, name: of.name, color: of.color, ...porPrio };
     });
-
+ 
     res.json({
       periodo_dias: days,
       generado_en: new Date().toISOString(),
@@ -201,7 +228,7 @@ app.get('/api/reporte', async (req, res) => {
     });
   } catch (e) { console.error(e); res.status(500).json({ error: e.message }); }
 });
-
+ 
 app.all('/api/v1/*', async (req, res) => {
   try {
     const query = Object.keys(req.query).length ? '?' + new URLSearchParams(req.query).toString() : '';
@@ -214,9 +241,9 @@ app.all('/api/v1/*', async (req, res) => {
     catch (e) { res.status(response.status).send(text); }
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
-
+ 
 app.get('/', (req, res) => res.send('Proxy GoRed OK'));
-
+ 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log('Proxy escuchando en puerto ' + PORT);
