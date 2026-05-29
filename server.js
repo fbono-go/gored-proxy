@@ -1,11 +1,11 @@
 const express = require('express');
 const compression = require('compression');
 const app = express();
- 
+
 const ZAMMAD_URL = 'https://help.gored.com.ar';
 const TOKEN = 'VsEhIeRS8p3oFIdq4XXePBe3RXLiLRBn2d9Ysrzuofw_tE1YPvCCQY8ywUQGwAvh';
 const HEADERS = { 'Authorization': 'Token token=' + TOKEN, 'Content-Type': 'application/json' };
- 
+
 const OWNERS = {
   // Referentes
   321:'Franco Bono', 61:'Juan Pablo Pioli', 40:'Simon Villavicencio',
@@ -31,7 +31,7 @@ const OFICIALES = [
 // Prioridades Zammad (custom GOred): 5=Vital, 2=Alta, 6=Media, 7=Baja
 const PRIO_LABELS = { 5:'Vital', 2:'Alta', 6:'Media', 7:'Baja' };
 const ALTA_COMPLEJIDAD = [5, 2]; // Vital + Alta
- 
+
 app.use(compression());
 app.use(express.json());
 app.use((req, res, next) => {
@@ -41,7 +41,7 @@ app.use((req, res, next) => {
   if (req.method === 'OPTIONS') return res.sendStatus(200);
   next();
 });
- 
+
 // Devuelve SOLO los tickets que realmente matchean (usando el array de IDs),
 // más el conteo total real (tickets_count) y los usuarios referenciados.
 async function searchWithAssets(query, perPage=200) {
@@ -55,15 +55,28 @@ async function searchWithAssets(query, perPage=200) {
   const count = (typeof data.tickets_count === 'number') ? data.tickets_count : tickets.length;
   return { tickets, users, count };
 }
- 
+
 function extraerDescripcion(body) {
   if (!body) return '';
-  const lines = body.split('\n').filter(l => l.trim());
-  const descLine = lines.find(l => l.includes('Descripción del evento:'));
-  if (descLine) return descLine.replace('Descripción del evento:', '').trim();
-  if (lines.length > 0) return lines[lines.length - 1].trim();
-  return '';
+  // Decodificar entidades HTML
+  body = body
+    .replace(/&lt;/g, '<').replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"').replace(/&#39;/g, "'")
+    .replace(/&amp;/g, '&');
+  // Remover todo HTML (tags y contenido de scripts/style)
+  body = body
+    .replace(/<script[^>]*>.*?<\/script>/gi, '')
+    .replace(/<style[^>]*>.*?<\/style>/gi, '')
+    .replace(/<[^>]+>/g, ' ');  // Remover tags, reemplazar con espacio
+  // Limpiar espacios múltiples y saltos
+  body = body
+    .replace(/\s+/g, ' ')
+    .trim();
+  // Limitar a 500 caracteres
+  if (body.length > 500) body = body.substring(0, 500) + '...';
+  return body || '';
 }
+
 async function fetchDescripcion(articleId) {
   try {
     const r = await fetch(`${ZAMMAD_URL}/api/v1/ticket_articles/${articleId}`, { headers: HEADERS });
@@ -71,7 +84,7 @@ async function fetchDescripcion(articleId) {
     return extraerDescripcion(a.body);
   } catch (e) { return ''; }
 }
- 
+
 // ── /api/dashboard?owner_id=321&destinos=67,66,68,76 ────
 app.get('/api/dashboard', async (req, res) => {
   try {
@@ -86,7 +99,7 @@ app.get('/api/dashboard', async (req, res) => {
     // Lista de owners a consultar: el referente + sus destinos (sin duplicados)
     const owners = [...new Set([ownerId, ...destinos])];
     const qs = owners.map(id => `owner_id:${id} AND (state_id:1 OR state_id:2)`);
- 
+
     const resultados = await Promise.all(qs.map(q => searchWithAssets(q, 200)));
     const allUsers = {}; resultados.forEach(r => Object.assign(allUsers, r.users));
     const seen = new Set(); const tickets = [];
@@ -102,14 +115,14 @@ app.get('/api/dashboard', async (req, res) => {
     res.json({ tickets, total: tickets.length });
   } catch (e) { console.error(e); res.status(500).json({ error: e.message }); }
 });
- 
+
 // ── /api/reporte?days=30 ────────────────────────────────
 app.get('/api/reporte', async (req, res) => {
   try {
     const days = parseInt(req.query.days || '30');
     const desde = new Date(Date.now() - days*24*3600*1000);
     const desdeIso = desde.toISOString().slice(0,10);
- 
+
     // TODAS las búsquedas en paralelo (1 sola tanda)
     const [
       nuevosRes,
@@ -124,24 +137,24 @@ app.get('/api/reporte', async (req, res) => {
       searchWithAssets(`owner_id:66 AND (state_id:1 OR state_id:2)`, 400),
       searchWithAssets(`owner_id:68 AND (state_id:1 OR state_id:2)`, 400)
     ]);
- 
+
     const totalNuevos = nuevosRes.count;
     const cerradosPorOficial = { 67: eliosCer.tickets, 66: carlosCer.tickets, 68: faustoCer.tickets };
     const sectorBCerrados = [...eliosCer.tickets, ...carlosCer.tickets, ...faustoCer.tickets];
     const sectorBOpen = [...eliosAb.tickets, ...carlosAb.tickets, ...faustoAb.tickets];
- 
+
     // Prioridades de los cerrados (3 oficiales)
     const prioridades = { Vital: 0, Alta: 0, Media: 0, Baja: 0 };
     for (const t of sectorBCerrados) {
       const lbl = PRIO_LABELS[t.priority_id];
       if (lbl) prioridades[lbl]++;
     }
- 
+
     // Vencidos vs en tiempo (abiertos sector B)
     const ahora = new Date();
     const vencidos = sectorBOpen.filter(t => t.escalation_at && new Date(t.escalation_at) < ahora).length;
     const enTiempo = sectorBOpen.length - vencidos;
- 
+
     // Helpers
     const horas = t => {
       if (!t.close_at || !t.created_at) return null;
@@ -164,7 +177,7 @@ app.get('/api/reporte', async (req, res) => {
       const tot = arr.length || 1;
       return { counts: f, pct: f.map(c => Math.round(c/tot*100)) };
     };
- 
+
     // Tarjetas por oficial
     const oficiales = OFICIALES.map(of => {
       const tk = cerradosPorOficial[of.id] || [];
@@ -182,7 +195,7 @@ app.get('/api/reporte', async (req, res) => {
         pct_alta_compl: tk.length ? Math.round(alta/tk.length*100) : 0
       };
     });
- 
+
     // Evolución semanal (últimas 4 semanas)
     const semanas = [];
     for (let i=3; i>=0; i--) {
@@ -197,7 +210,7 @@ app.get('/api/reporte', async (req, res) => {
       const hs = tk.map(horas).filter(h => h !== null && h >= 0);
       return hs.length ? +(hs.reduce((a,b)=>a+b,0)/hs.length).toFixed(1) : 0;
     });
- 
+
     // Tiempo por prioridad y oficial
     const tiempoPorPrioridad = OFICIALES.map(of => {
       const tk = cerradosPorOficial[of.id] || [];
@@ -208,7 +221,7 @@ app.get('/api/reporte', async (req, res) => {
       }
       return { id: of.id, name: of.name, color: of.color, ...porPrio };
     });
- 
+
     res.json({
       periodo_dias: days,
       generado_en: new Date().toISOString(),
@@ -228,7 +241,7 @@ app.get('/api/reporte', async (req, res) => {
     });
   } catch (e) { console.error(e); res.status(500).json({ error: e.message }); }
 });
- 
+
 app.all('/api/v1/*', async (req, res) => {
   try {
     const query = Object.keys(req.query).length ? '?' + new URLSearchParams(req.query).toString() : '';
@@ -241,9 +254,9 @@ app.all('/api/v1/*', async (req, res) => {
     catch (e) { res.status(response.status).send(text); }
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
- 
+
 app.get('/', (req, res) => res.send('Proxy GoRed OK'));
- 
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log('Proxy escuchando en puerto ' + PORT);
