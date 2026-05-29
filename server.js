@@ -63,19 +63,25 @@ function extraerDescripcion(body) {
     .replace(/&lt;/g, '<').replace(/&gt;/g, '>')
     .replace(/&quot;/g, '"').replace(/&#39;/g, "'")
     .replace(/&amp;/g, '&');
-  // Remover todo HTML (tags y contenido de scripts/style)
+  // Remover todo HTML
   body = body
     .replace(/<script[^>]*>.*?<\/script>/gi, '')
     .replace(/<style[^>]*>.*?<\/style>/gi, '')
-    .replace(/<[^>]+>/g, ' ');  // Remover tags, reemplazar con espacio
+    .replace(/<[^>]+>/g, ' ');
   // Limpiar espacios múltiples y saltos
   body = body
     .replace(/\s+/g, ' ')
     .trim();
+  
+  // Validar: si es solo números/caracteres especiales o muy corto, es inválido
+  const onlyNumbers = /^\d+$/.test(body);
+  if (onlyNumbers || body.length < 5) return '';
+  
   // Limitar a 500 caracteres
   if (body.length > 500) body = body.substring(0, 500) + '...';
   return body || '';
 }
+
 
 async function fetchDescripcion(articleId) {
   try {
@@ -84,6 +90,25 @@ async function fetchDescripcion(articleId) {
     return extraerDescripcion(a.body);
   } catch (e) { return ''; }
 }
+
+// ── /api/test-desc/:articleId (DEBUG) ────────────────────
+app.get('/api/test-desc/:articleId', async (req, res) => {
+  try {
+    const articleId = req.params.articleId;
+    const r = await fetch(`${ZAMMAD_URL}/api/v1/ticket_articles/${articleId}`, { headers: HEADERS });
+    const a = await r.json();
+    res.json({
+      id: a.id,
+      body_raw: a.body,
+      body_length: (a.body || '').length,
+      body_cleaned: extraerDescripcion(a.body),
+      type_id: a.type_id,
+      sender_id: a.sender_id
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
 
 // ── /api/dashboard?owner_id=321&destinos=67,66,68,76 ────
 app.get('/api/dashboard', async (req, res) => {
