@@ -138,7 +138,19 @@ app.get('/api/dashboard', async (req, res) => {
     tickets.forEach((t, i) => {
       const c = allUsers[t.customer_id] || {};
       t.customer_email = c.email || '';
-      t.customer_name = ((c.firstname||'')+' '+(c.lastname||'')).trim();
+      let customer_name = ((c.firstname||'')+' '+(c.lastname||'')).trim();
+      
+      // Si no hay nombre pero hay email, usar el prefijo del email como nombre
+      if (!customer_name && t.customer_email) {
+        customer_name = t.customer_email.split('@')[0];
+      }
+      
+      // Si sigue sin nombre, mostrar "Cliente #ID"
+      if (!customer_name) {
+        customer_name = 'Cliente ' + t.customer_id;
+      }
+      
+      t.customer_name = customer_name;
       t.owner_name = OWNERS[t.owner_id] || ('Agente '+t.owner_id);
       t.descripcion = descs[i] || '';
     });
