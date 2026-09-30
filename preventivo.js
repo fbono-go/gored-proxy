@@ -23,6 +23,9 @@ const TOKEN = process.env.PREV_TOKEN || '';
 
 const TTL_CACHE_MS = 5 * 60 * 1000;   // relectura preventiva de la planilla
 const TIMEOUT_SHEETS_MS = 30000;
+// Guardar desde el editor puede esperar el turno de la planilla (otro técnico
+// guardando) y además escribir varias filas: se le da más margen.
+const TIMEOUT_CATALOGO_MS = 90000;
 // Tres colores, iguales en el servidor, las apps y el panel:
 //   rojo = vencido o sin fecha · amarillo = vence en 7 días o menos · verde = el resto
 const DIAS_AMARILLO = 7;
@@ -241,12 +244,12 @@ function raizDe(d, equipo, vistos) {
 
 // ============================================================ Apps Script
 
-async function llamarSheets(payload) {
+async function llamarSheets(payload, esperaMs) {
   if (!SHEETS_URL) throw new Error('Falta PREV_SHEETS_URL');
   if (!TOKEN) throw new Error('Falta PREV_TOKEN');
 
   const ctrl = new AbortController();
-  const t = setTimeout(() => ctrl.abort(), TIMEOUT_SHEETS_MS);
+  const t = setTimeout(() => ctrl.abort(), esperaMs || TIMEOUT_SHEETS_MS);
   try {
     const resp = await fetch(SHEETS_URL, {
       method: 'POST',
@@ -1259,7 +1262,14 @@ async function guardarCatalogo(d, tipos, campos, autor) {
   const sello = { modificado: ahoraLocal(), modificado_por: norm(autor).slice(0, 60) || 'administrador' };
   const T = tipos.map((t) => Object.assign({}, t, sello));
   const C = campos.map((c) => Object.assign({}, c, sello));
-  await llamarSheets({ accion: 'guardar_catalogo', tipos: T, campos: C });
+  try {
+    await llamarSheets({ accion: 'guardar_catalogo', tipos: T, campos: C }, TIMEOUT_CATALOGO_MS);
+  } catch (e) {
+    if (e && e.name === 'AbortError') {
+      throw new Error('La planilla tardó demasiado en responder. Recargá la página para ver si se guardó.');
+    }
+    throw e;
+  }
 
   for (const t of T) {
     const f = filaTipo(d, t.tipo_id);
