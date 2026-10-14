@@ -2477,8 +2477,13 @@ function montarPreventivo(app, opciones) {
   app.get(`${base}/cambios`, auth, asinc(async (req, res) => {
     const d = await datos(false);
     const estado = norm(req.query.estado).toLowerCase() || 'pendiente';
+    const instituciones = institucionesPedidas(req.query);
 
-    let lista = (d.cambios || []).map((c) => ({
+    const delAlcance = (d.cambios || []).filter((c) => !instituciones ||
+      instituciones.has(num((d.porEquipo.get(norm(c.equipo_id).toUpperCase()) || {}).institucion_id)));
+
+    let lista = delAlcance
+      .map((c) => ({
       cambio_id: norm(c.cambio_id),
       fecha: norm(c.fecha),
       equipo_id: norm(c.equipo_id),
@@ -2499,7 +2504,7 @@ function montarPreventivo(app, opciones) {
     lista.sort((a, b) => String(b.fecha).localeCompare(String(a.fecha)));
 
     const resumen = { pendiente: 0, aprobado: 0, rechazado: 0 };
-    for (const c of (d.cambios || [])) {
+    for (const c of delAlcance) {
       const e = norm(c.estado) || 'pendiente';
       resumen[e] = (resumen[e] || 0) + 1;
     }
@@ -2874,12 +2879,12 @@ function montarPreventivo(app, opciones) {
   // --- bandeja de revisión de correctivos --------------------------------
   app.get(`${base}/bandeja`, auth, asinc(async (req, res) => {
     const d = await datos(false);
-    const institucion = num(req.query.institucion);
+    const instituciones = institucionesPedidas(req.query);
 
     const pendientes = (d.correctivos || [])
       .filter((c) => norm(c.estado) === 'en_bandeja')
       .map((c) => armarCaso(d, c))
-      .filter((c) => !institucion || c.ticket.institucion_id === institucion)
+      .filter((c) => !instituciones || instituciones.has(c.ticket.institucion_id))
       .sort((a, b) => String(b.fecha_deteccion).localeCompare(String(a.fecha_deteccion)));
 
     res.json({ ok: true, total: pendientes.length, pendientes });
@@ -3027,6 +3032,20 @@ const CAMPOS_DIRECTOS = new Set([
   'ref_consumo_a', 'ref_capacitor_uf', 'cant_compresores', 'notas',
 ]);
 const EMPRESA_PROPIA = 'Personal propio';
+
+/**
+ * Instituciones pedidas: `?instituciones=13,14,33` (varias) o `?institucion=13`.
+ * Devuelve un Set de ids, o null si no se pidió ninguna (= sin filtro).
+ * Si se pidió pero no hay un solo número válido, es un Set vacío: no se
+ * muestra nada, en lugar de mostrar todo por error.
+ */
+function institucionesPedidas(q) {
+  const crudo = [norm(q.instituciones), norm(q.institucion)].filter(Boolean).join(',');
+  if (!crudo) return null;
+  const ids = new Set();
+  for (const x of crudo.split(',')) { const n = num(x); if (n !== null && n !== undefined && n !== '') ids.add(n); }
+  return ids;
+}
 
 /** "Personal propio" o vacío → equipo oficial; cualquier otro nombre → externo de esa empresa. */
 function valoresDeEmpresa(nombre) {
