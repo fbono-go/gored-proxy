@@ -5,10 +5,13 @@ const app = express();
 
 const ZAMMAD_URL = 'https://help.gored.com.ar';
 const PORTAL_URL = 'https://gored.com.ar'; // portal de empleados (creación de tickets "como si lo hiciera el referente a mano")
-// PENDIENTE DE SEGURIDAD: este token estuvo expuesto en un repo público.
-// Hay que revocarlo en Zammad, generar uno nuevo y dejar solo:
-//     const TOKEN = process.env.ZAMMAD_TOKEN;
-const TOKEN = 'VsEhIeRS8p3oFIdq4XXePBe3RXLiLRBn2d9Ysrzuofw_tE1YPvCCQY8ywUQGwAvh';
+// Token de servicio de Zammad: se lee SOLO de las variables de entorno de Render.
+// Nunca escribirlo en el código: el repo y su historial lo exponen.
+const TOKEN = (process.env.ZAMMAD_TOKEN || '').trim();
+if (!TOKEN) {
+  console.error('FATAL: falta la variable ZAMMAD_TOKEN en Render. El proxy no arranca sin ella.');
+  process.exit(1);
+}
 const HEADERS = { 'Authorization': 'Token token=' + TOKEN, 'Content-Type': 'application/json' };
 
 // Prioridades Zammad (custom GOred): 5=Vital, 2=Alta, 6=Media, 7=Baja
@@ -721,17 +724,25 @@ app.get('/api/adjunto/:ticketId/:articleId/:attId', async (req, res) => {
   }
 });
 
+// Única lectura permitida sin token propio: el artículo original de un ticket (fotos),
+// que oficial.html y proveedor.html piden aunque el usuario no haya cargado su token.
+// Cualquier otra operación (escribir, listar usuarios, buscar, admin) exige el token del usuario.
+const ANONIMO_PERMITIDO = /^\/api\/v1\/ticket_articles\/\d+$/;
+
 app.all('/api/v1/*', async (req, res) => {
   try {
+    const authHeader = req.get('Authorization');
+    let auth = authHeader;
+    if (!authHeader) {
+      if (req.method !== 'GET' || !ANONIMO_PERMITIDO.test(req.path)) {
+        console.warn('[auth] rechazado sin token:', req.method, req.path);
+        return res.status(401).json({ error: 'Falta el token de usuario. Cargalo en Config.' });
+      }
+      auth = HEADERS['Authorization'];
+    }
     const query = Object.keys(req.query).length ? '?' + new URLSearchParams(req.query).toString() : '';
     const url = ZAMMAD_URL + req.path + query;
-    // Usar el token que envía la app (el del usuario logueado).
-    // Si no viene, caer al token por defecto.
-    const authHeader = req.get('Authorization');
-    const headers = {
-      'Authorization': authHeader || HEADERS['Authorization'],
-      'Content-Type': 'application/json'
-    };
+    const headers = { 'Authorization': auth, 'Content-Type': 'application/json' };
     const options = { method: req.method, headers };
     if (['POST', 'PUT', 'PATCH'].includes(req.method) && req.body) options.body = JSON.stringify(req.body);
     const response = await fetch(url, options);
