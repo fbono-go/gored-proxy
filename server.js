@@ -336,6 +336,32 @@ async function mapLimit(items, limite, tarea) {
   return salida;
 }
 
+// Rótulos de los campos del formulario del portal: marcan dónde termina la
+// "Descripción del evento". Se corta SOLO en ellos, no en cualquier renglón con
+// mayúscula: la descripción puede ser multilínea (el correctivo generado por el
+// preventivo trae "Equipo:", "Ubicación:", "Lo detectó:", "Desvíos:"…, y el
+// renglón "LISTO" de oficial.html) y tiene que llegar completa.
+const RE_FIN_DESCRIPCION = /^(?:(?:ID|Fecha|Empleado|T[ií]tulo|Instituci[oó]n|Lugar|Piso|[AÁ]rea|Categor[ií]a|Subcategor[ií]a|Descripci[oó]n del lugar)\s*:|DATOS DEL|Se ha creado)/i;
+const RE_INICIO_EVENTO = /Descripci[oó]n del evento\s*:\s*/i;
+const DESC_MAX = 1500;
+
+// Una sola pasada sobre las líneas ya limpias: junta desde "Descripción del
+// evento:" hasta el próximo rótulo de campo (o el final del cuerpo).
+function extraerEvento(lineas) {
+  let desc = null;
+  for (const l of lineas) {
+    if (desc === null) {
+      const m = RE_INICIO_EVENTO.exec(l);
+      if (m) desc = [l.slice(m.index + m[0].length)];
+    } else if (RE_FIN_DESCRIPCION.test(l)) {
+      break;
+    } else {
+      desc.push(l);
+    }
+  }
+  return desc ? desc.filter(Boolean).join('\n') : '';
+}
+
 function extraerDescripcion(body) {
   if (!body) return '';
   // Decodificar entidades HTML
@@ -360,13 +386,9 @@ function extraerDescripcion(body) {
   const textoCompleto = lineas.join('\n');
 
   // PRIORIDAD: extraer solo "Descripción del evento:" si existe
-  // Corta en el próximo renglón que empieza con mayúscula (otro campo del
-  // formulario), EXCEPTO el renglón "LISTO" que agrega el botón "Trabajo
-  // terminado" de oficial.html: ese es parte de la descripción.
-  const matchEvento = textoCompleto.match(/Descripci[oó]n del evento\s*:\s*(.+?)(?:\n(?!LISTO\s*(?:\n|$))(?:[A-Z]|\n)|$)/si);
-  if (matchEvento && matchEvento[1].trim().length > 5) {
-    const desc = matchEvento[1].trim();
-    return desc.length > 500 ? desc.substring(0, 500) + '...' : desc;
+  const evento = extraerEvento(lineas);
+  if (evento.length > 5) {
+    return evento.length > DESC_MAX ? evento.substring(0, DESC_MAX) + '...' : evento;
   }
 
   // Si el body es la notificación automática ("El ticket de mantenimiento..."), no es útil
