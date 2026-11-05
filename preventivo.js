@@ -418,18 +418,34 @@ function checklistDe(d, tipoId, vistos) {
   return armado;
 }
 
-function armarChecklist(d, tipoId, vistos) {
+/**
+ * Las preguntas del ALTA de un tipo: lo que se pide una sola vez, al dar de alta
+ * el equipo (tipo de matafuego, agente, etc.). Viven en la misma hoja que el
+ * checklist, marcadas con momento = alta, y se heredan igual que él.
+ */
+function altaDe(d, tipoId) {
+  const clave = 'alta:' + norm(tipoId);
+  if (d.checklists && d.checklists.has(clave)) return d.checklists.get(clave);
+  const armado = armarChecklist(d, norm(tipoId), null, true);
+  if (d.checklists) d.checklists.set(clave, armado);
+  return armado;
+}
+
+/** ¿Es una pregunta del alta y no del checklist? Sin la columna, ninguna lo es. */
+const esAlta = (c) => norm(c.momento).toLowerCase() === 'alta';
+
+function armarChecklist(d, tipoId, vistos, alta) {
   vistos = vistos || new Set();
   if (vistos.has(tipoId)) return [];       // corta herencias circulares
   vistos.add(tipoId);
 
   const tipo = d.catalogo_tipos.find((t) => norm(t.tipo_id) === norm(tipoId));
   const propios = d.tipos_campos
-    .filter((c) => norm(c.tipo_id) === norm(tipoId) && esSi(c.activo))
+    .filter((c) => norm(c.tipo_id) === norm(tipoId) && esSi(c.activo) && esAlta(c) === !!alta)
     .map(normalizarCampo);
 
   const heredados = tipo && norm(tipo.hereda_de)
-    ? armarChecklist(d, norm(tipo.hereda_de), vistos)
+    ? armarChecklist(d, norm(tipo.hereda_de), vistos, alta)
     : [];
 
   // un campo propio con el mismo campo_id pisa al heredado
@@ -572,6 +588,69 @@ function valorDe(respuestas, campo) {
   if (campo.repeticiones > 1) return Array.isArray(v) ? v[campo.indice] : undefined;
   return Array.isArray(v) ? v[0] : v;
 }
+
+/**
+ * Valida y normaliza las respuestas a las preguntas del alta.
+ *
+ * El servidor no confía en lo que mandó el celular: cada valor se convierte al
+ * tipo de su pregunta y las opciones se comparan contra la lista cerrada. Lo que
+ * no pertenece a ninguna pregunta del tipo se descarta en vez de guardarse.
+ *
+ * `parcial` = una corrección: solo se miran las preguntas que vinieron, y una
+ * respuesta vacía en una no obligatoria significa "borrar el dato".
+ * Devuelve { datos, faltan, errores }.
+ */
+function validarDatos(campos, entrada, parcial) {
+  const datos = {};
+  const faltan = [];
+  const errores = [];
+  const crudo = entrada && typeof entrada === 'object' && !Array.isArray(entrada) ? entrada : {};
+
+  for (const c of campos) {
+    const vino = Object.prototype.hasOwnProperty.call(crudo, c.campo_id);
+    if (parcial && !vino) continue;
+
+    let v = crudo[c.campo_id];
+    if (typeof v === 'string') v = v.trim();
+    if (v === undefined || v === null || v === '') {
+      if (c.requerido) faltan.push(c.etiqueta);
+      else if (parcial) datos[c.campo_id] = '';
+      continue;
+    }
+
+    if (c.tipo_campo === 'numero') {
+      const n = num(v);
+      if (n === null) { errores.push(`${c.etiqueta}: tiene que ser un número`); continue; }
+      if ((c.min !== null && n < c.min) || (c.max !== null && n > c.max)) {
+        errores.push(`${c.etiqueta}: fuera del rango permitido`);
+        continue;
+      }
+      datos[c.campo_id] = n;
+    } else if (c.tipo_campo === 'si_no') {
+      const t = String(v).toLowerCase();
+      if (t !== 'true' && t !== 'false') { errores.push(`${c.etiqueta}: respuesta inválida`); continue; }
+      datos[c.campo_id] = t === 'true';
+    } else if (c.tipo_campo === 'opciones') {
+      if (!c.opciones.some((o) => o.v === String(v))) {
+        errores.push(`${c.etiqueta}: opción inválida`);
+        continue;
+      }
+      datos[c.campo_id] = String(v);
+    } else {
+      datos[c.campo_id] = String(v).slice(0, 120);
+    }
+  }
+  return { datos, faltan, errores };
+}
+
+/**
+ * Las respuestas del alta se guardan en una columna de la hoja `equipos`. Si esa
+ * columna no existe, el Apps Script descartaría el dato en silencio y el técnico
+ * creería que quedó guardado. Se frena antes, con un mensaje que dice qué falta.
+ */
+const hayColumnaDatos = (d) => d.equipos.some((e) => 'datos_json' in e);
+const ERROR_COLUMNA_DATOS = 'Falta la columna «datos_json» en la hoja equipos de la planilla. ' +
+  'Agregala (fila de encabezados) y volvé a intentar.';
 
 function tipoInfo(d, tipoId) {
   const clave = norm(tipoId);
@@ -974,6 +1053,7 @@ function equipoConEstado(d, eq, mapaEstado) {
     estado_equipo: norm(eq.estado_equipo) || 'activo',
     marca: norm(eq.marca),
     capacidad: norm(eq.capacidad),
+    datos: parseJson(eq.datos_json) || {},   // respuestas a las preguntas del alta del tipo
     motivo_baja: norm(eq.motivo_baja),
     ref_consumo_a: norm(eq.ref_consumo_a),   // valor único o lista "18;18;14"
     ref_capacitor_uf: norm(eq.ref_capacitor_uf),
@@ -1081,6 +1161,11 @@ const FUNCION_POR_BLOQUE = {
 };
 // `calculado` no se crea desde el editor: solo se conserva el que ya existe.
 const TIPOS_RESPUESTA = ['si_no', 'opciones', 'numero', 'texto', 'foto'];
+// Las preguntas del alta no llevan foto ni regla de aviso: son datos del equipo.
+const TIPOS_RESPUESTA_ALTA = ['si_no', 'opciones', 'numero', 'texto'];
+// Campo común a todos los checklists (bloque base_general): la pantalla lo dibuja
+// como el recuadro de observaciones, no como una pregunta más.
+const CAMPO_OBSERVACIONES = 'observaciones';
 const REFS_EQUIPO = {
   ref_consumo_a: 'Consumo de chapa del equipo (A)',
   ref_capacitor_uf: 'Capacidad nominal del capacitor (µF)',
@@ -1289,7 +1374,7 @@ function vistaCatalogo(d) {
       usado_por: [...usan].filter((x) => x !== id),
     };
   });
-  const campos = d.tipos_campos.filter((c) => norm(c.tipo_id) && norm(c.campo_id)).map((c) => {
+  const filas = d.tipos_campos.filter((c) => norm(c.tipo_id) && norm(c.campo_id)).map((c) => {
     const n = normalizarCampo(c);
     return {
       tipo_id: norm(c.tipo_id),
@@ -1309,10 +1394,28 @@ function vistaCatalogo(d) {
       activo: esSi(c.activo),
       cuando_avisa: textoRegla(c),
       regla: reglaParaEditor(textoRegla(c)),
+      alta: esAlta(c),
     };
   });
-  return { tipos, campos, refs: REFS_EQUIPO };
+  // El editor del checklist no tiene que ver las preguntas del alta: van aparte.
+  // `alta_lista` avisa si la planilla ya tiene la columna `momento`; sin ella
+  // no se pueden crear preguntas del alta (se guardarían como del checklist).
+  return {
+    tipos,
+    campos: filas.filter((c) => !c.alta),
+    alta: filas.filter((c) => c.alta),
+    alta_lista: d.tipos_campos.some((c) => 'momento' in c) && hayColumnaDatos(d),
+    refs: REFS_EQUIPO,
+  };
 }
+
+/**
+ * Un dato del alta no cambia el checklist: no sube su versión. Igual se manda el
+ * tipo (solo con su sello de modificación) en vez de una lista vacía: el Apps
+ * Script nunca recibe un arreglo sin filas, que en una hoja de cálculo es un
+ * error clásico (getRange con 0 filas).
+ */
+const sinVersion = (tipoId) => [{ tipo_id: norm(tipoId) }];
 
 /** Un cambio en las preguntas es una versión nueva del checklist de todos los que lo heredan. */
 const subirVersiones = (d, tipoId) => [...tiposQueUsan(d, tipoId)].map((id) => ({
@@ -1548,6 +1651,13 @@ function montarAdmin(app, base, asinc) {
     const existente = p.campo_id ? filaCampo(d, tipoId, p.campo_id) : null;
     if (p.campo_id && !existente) return mal(res, 404, 'No existe esa pregunta en este tipo');
 
+    // Pregunta del alta o del checklist: se decide al crearla y no cambia nunca.
+    const alta = existente ? esAlta(existente) : norm(p.momento).toLowerCase() === 'alta';
+    if (alta && !existente && !d.tipos_campos.some((c) => 'momento' in c)) {
+      return mal(res, 503, 'Falta la columna «momento» en la hoja tipos_campos de la planilla. ' +
+        'Agregala (fila de encabezados) antes de crear preguntas del alta.');
+    }
+
     const etiqueta = norm(p.etiqueta).slice(0, 120);
     if (!etiqueta) return mal(res, 400, 'Falta escribir la pregunta');
 
@@ -1561,7 +1671,7 @@ function montarAdmin(app, base, asinc) {
           'no se puede cambiar. Retirala y creá una nueva.');
       }
     }
-    if (tipoCampo !== 'calculado' && !TIPOS_RESPUESTA.includes(tipoCampo)) {
+    if (tipoCampo !== 'calculado' && !(alta ? TIPOS_RESPUESTA_ALTA : TIPOS_RESPUESTA).includes(tipoCampo)) {
       return mal(res, 400, 'Tipo de respuesta desconocido');
     }
 
@@ -1595,7 +1705,8 @@ function montarAdmin(app, base, asinc) {
       const marcadas = opciones.filter((o) => o.avisa).map((o) => o.v);
       pedida = marcadas.length ? { op: 'opciones', valores: marcadas } : { op: 'nunca' };
     }
-    const regla = reglaATexto(pedida, { tipo_campo: tipoCampo, opciones });
+    // un dato del alta nunca avisa: no hay nada que medir
+    const regla = alta ? { texto: '' } : reglaATexto(pedida, { tipo_campo: tipoCampo, opciones });
     if (regla.error) return mal(res, 400, regla.error);
 
     const numerico = tipoCampo === 'numero' || tipoCampo === 'calculado';
@@ -1606,7 +1717,7 @@ function montarAdmin(app, base, asinc) {
       opciones: opciones.map((o) => `${o.v}|${o.t}`).join(';'),
       unidad: numerico ? norm(p.unidad).replace(/[|;]/g, '').slice(0, 12) : '',
       cuando_avisa: regla.texto,
-      autocompletable: (tipoCampo === 'si_no' || tipoCampo === 'opciones') && p.autocompletable ? 'SI' : 'NO',
+      autocompletable: !alta && (tipoCampo === 'si_no' || tipoCampo === 'opciones') && p.autocompletable ? 'SI' : 'NO',
       ayuda: norm(p.ayuda).slice(0, 300),
     };
     // Si la regla vivía en una columna vieja, se vacía: si no, seguiría
@@ -1636,20 +1747,28 @@ function montarAdmin(app, base, asinc) {
       // lo nuevo va al final de lo propio, siempre antes de fotos y observaciones
       // (900 y 910), que cierran todo checklist
       const antesDeFotos = (c) => (num(c.orden) ?? 999) < 900;
-      const propias = d.tipos_campos.filter((c) => norm(c.tipo_id) === tipoId && esSi(c.activo) && antesDeFotos(c));
+      const propias = d.tipos_campos.filter((c) => norm(c.tipo_id) === tipoId && esSi(c.activo) &&
+        antesDeFotos(c) && !esAlta(c));
       const referencia = propias.length ? propias : checklistDe(d, tipoId).filter(antesDeFotos);
       const ultimo = referencia.length ? Math.max(...referencia.map((c) => num(c.orden) ?? 0))
         : (tipoId === 'base_general' ? 880 : 0);
+      // las del alta se ordenan entre ellas, desde 10
+      const hermanas = alta
+        ? d.tipos_campos.filter((c) => norm(c.tipo_id) === tipoId && esSi(c.activo) && esAlta(c))
+        : [];
+      const ultimaAlta = hermanas.length ? Math.max(...hermanas.map((c) => num(c.orden) ?? 0)) : 0;
       Object.assign(fila, {
         campo_id: unico(slug(etiqueta, 30) || 'pregunta', enUso),
-        orden: Math.min(ultimo + 10, 899),
+        orden: alta ? ultimaAlta + 10 : Math.min(ultimo + 10, 899),
         activo: 'SI',
         formula: '',
         repetir_por: '',
       });
+      if (alta) fila.momento = 'alta';
     }
 
-    await guardarCatalogo(d, subirVersiones(d, tipoId), [fila], p.autor);
+    // Cambiar un dato del alta no cambia el checklist: no sube su versión.
+    await guardarCatalogo(d, alta ? sinVersion(tipoId) : subirVersiones(d, tipoId), [fila], p.autor);
     res.json(Object.assign({ ok: true, campo_id: fila.campo_id }, vistaCatalogo(d)));
   }));
 
@@ -1661,7 +1780,8 @@ function montarAdmin(app, base, asinc) {
     const fila = filaCampo(d, p.tipo_id, p.campo_id);
     if (!fila) return mal(res, 404, 'No existe esa pregunta en este tipo');
     const tipoId = norm(fila.tipo_id);
-    if (!p.activo) {
+    const alta = esAlta(fila);
+    if (!p.activo && !alta) {
       // un campo calculado que la usa dejaría de calcularse, y de avisar
       const alcance = new Set([...cadenaDe(d, tipoId), ...tiposQueUsan(d, tipoId)]);
       const id = norm(fila.campo_id);
@@ -1669,7 +1789,7 @@ function montarAdmin(app, base, asinc) {
         norm(c.formula) && (norm(c.formula).match(/[A-Za-z_][A-Za-z0-9_]*/g) || []).includes(id));
       if (calc) return mal(res, 409, `La usa el cálculo de «${norm(calc.etiqueta)}». Retirá ese primero.`);
     }
-    await guardarCatalogo(d, subirVersiones(d, tipoId),
+    await guardarCatalogo(d, alta ? sinVersion(tipoId) : subirVersiones(d, tipoId),
       [{ tipo_id: tipoId, campo_id: norm(fila.campo_id), activo: p.activo ? 'SI' : 'NO' }], p.autor);
     res.json(Object.assign({ ok: true }, vistaCatalogo(d)));
   }));
@@ -1684,7 +1804,9 @@ function montarAdmin(app, base, asinc) {
     if (!tipo) return mal(res, 404, 'No existe ese tipo');
     const tipoId = norm(tipo.tipo_id);
 
-    const propias = d.tipos_campos.filter((c) => norm(c.tipo_id) === tipoId && esSi(c.activo));
+    // el checklist y el alta se ordenan por separado
+    const alta = norm(p.momento).toLowerCase() === 'alta';
+    const propias = d.tipos_campos.filter((c) => norm(c.tipo_id) === tipoId && esSi(c.activo) && esAlta(c) === alta);
     const pedido = (Array.isArray(p.campos) ? p.campos : []).map(norm);
     const ids = new Set(propias.map((c) => norm(c.campo_id)));
     if (pedido.length !== ids.size || new Set(pedido).size !== ids.size || !pedido.every((x) => ids.has(x))) {
@@ -1699,7 +1821,7 @@ function montarAdmin(app, base, asinc) {
       const c = propias.find((x) => norm(x.campo_id) === id);
       if ((num(c.orden) ?? 999) !== lugares[i]) cambios.push({ tipo_id: tipoId, campo_id: id, orden: lugares[i] });
     });
-    if (cambios.length) await guardarCatalogo(d, subirVersiones(d, tipoId), cambios, p.autor);
+    if (cambios.length) await guardarCatalogo(d, alta ? sinVersion(tipoId) : subirVersiones(d, tipoId), cambios, p.autor);
     res.json(Object.assign({ ok: true }, vistaCatalogo(d)));
   }));
 }
@@ -1752,7 +1874,10 @@ function montarPreventivo(app, opciones) {
       .filter((t) => esSi(t.activo) && norm(t.tipo_id))
       .map((t) => {
         const info = tipoInfo(d, t.tipo_id);
-        return Object.assign({}, info, { campos: checklistDe(d, info.tipo_id) });
+        return Object.assign({}, info, {
+          campos: checklistDe(d, info.tipo_id),
+          alta: altaDe(d, info.tipo_id),
+        });
       });
     res.json({ ok: true, tipos });
   }));
@@ -1824,6 +1949,24 @@ function montarPreventivo(app, opciones) {
     if (responsable === 'externo' && !empresa) {
       return res.status(400).json({ ok: false, error: 'Falta la empresa que mantiene el equipo. Elegila en Config.' });
     }
+
+    // Preguntas propias del tipo (tipo de matafuego, agente, etc.): se validan acá
+    // contra la configuración, no contra lo que el celular dice que preguntó.
+    const camposAlta = altaDe(d, info.tipo_id);
+    let datosJson = '';
+    if (camposAlta.length) {
+      if (!hayColumnaDatos(d)) return res.status(503).json({ ok: false, error: ERROR_COLUMNA_DATOS });
+      const v = validarDatos(camposAlta, p.datos, false);
+      if (v.faltan.length || v.errores.length) {
+        return res.status(400).json({
+          ok: false,
+          error: v.faltan.length ? 'Faltan datos del equipo' : v.errores[0],
+          faltan: v.faltan,
+        });
+      }
+      datosJson = JSON.stringify(v.datos);
+    }
+
     const equipo = {
       equipo_id: id,
       tipo: info.tipo_id,
@@ -1853,6 +1996,9 @@ function montarPreventivo(app, opciones) {
       lugar_id: num(p.lugar_id) ?? '',
       piso_id: num(p.piso_id) ?? '',
     };
+    // solo viaja si el tipo tiene preguntas de alta: así un tipo sin ellas escribe
+    // exactamente lo mismo que antes, exista o no la columna
+    if (camposAlta.length) equipo.datos_json = datosJson;
 
     // el alta reparte el primer vencimiento; el preventivo que venga después lo pisa
     const primeraFecha = primerVencimiento(equipo, periodicidad, HOY());
@@ -1946,12 +2092,27 @@ function montarPreventivo(app, opciones) {
     // el servidor recalcula: lo que dijo el cliente es solo para mostrar en pantalla
     const respuestas = completarCalculados(checklist, p.respuestas || {});
 
+    // Un texto es texto: se recorta y no se interpreta. Sin esto, cualquier cosa
+    // que mande el celular quedaría en respuestas_json tal cual.
+    for (const c of checklist) {
+      if (c.tipo_campo !== 'texto' || c.campo_id === CAMPO_OBSERVACIONES) continue;
+      const t = respuestas[c.campo_id];
+      if (typeof t === 'string') respuestas[c.campo_id] = t.trim().slice(0, 120);
+      else if (t !== undefined && t !== null) delete respuestas[c.campo_id];
+    }
+
+    // La foto y las observaciones no viajan dentro de `respuestas`: tienen su propio
+    // lugar en el registro. Una pregunta de foto obligatoria se cumple con una foto.
+    const cantFotos = Array.isArray(p.fotos) ? p.fotos.filter(Boolean).length : (norm(p.fotos) ? 1 : 0);
+    const sinRespuesta = (c) => {
+      if (c.tipo_campo === 'foto') return cantFotos === 0;
+      if (c.campo_id === CAMPO_OBSERVACIONES) return !norm(p.observaciones);
+      const v = valorDe(respuestas, c);
+      return v === undefined || v === null || v === '';
+    };
     const faltan = checklist
       .filter((c) => c.requerido && c.tipo_campo !== 'calculado')
-      .filter((c) => {
-        const v = valorDe(respuestas, c);
-        return v === undefined || v === null || v === '';
-      })
+      .filter(sinRespuesta)
       .map((c) => c.etiqueta);
 
     // Online se rechaza: el técnico está frente al equipo y puede completarlo.
@@ -2404,7 +2565,49 @@ function montarPreventivo(app, opciones) {
     const pendientes = [];
     const directos = {};
 
+    // Los datos del alta (tipo de matafuego, etc.) se corrigen en el momento, como
+    // la marca o la capacidad: cada dato que cambia deja su renglón en `cambios`.
+    if (campos.datos && typeof campos.datos === 'object') {
+      const info = tipoInfo(d, eq.tipo || eq.tipo_id);
+      const v = validarDatos(info ? altaDe(d, info.tipo_id) : [], campos.datos, true);
+      if (v.faltan.length || v.errores.length) {
+        return res.status(400).json({
+          ok: false,
+          error: v.faltan.length ? 'Faltan datos del equipo' : v.errores[0],
+          faltan: v.faltan,
+        });
+      }
+      const actuales = parseJson(eq.datos_json) || {};
+      const cambiados = Object.keys(v.datos).filter((k) => String(actuales[k] ?? '') !== String(v.datos[k]));
+      if (cambiados.length) {
+        if (!hayColumnaDatos(d)) return res.status(503).json({ ok: false, error: ERROR_COLUMNA_DATOS });
+        for (const k of cambiados) {
+          const fila = {
+            cambio_id: uuidV4(),
+            fecha: ahoraLocal(),
+            equipo_id: equipoId,
+            equipo_referencia: referencia(eq),
+            campo: 'dato_' + k,
+            valor_anterior: String(actuales[k] ?? ''),
+            valor_nuevo: String(v.datos[k]),
+            motivo: norm(p.motivo),
+            solicitado_por: quien,
+            rol: norm(p.rol),
+            estado: 'aprobado',
+            decidido_por: quien,
+            fecha_decision: ahoraLocal(),
+            motivo_decision: 'Corrección directa del técnico',
+          };
+          await llamarSheets({ accion: 'cambio', cambio: fila });
+          aplicarLocal(d, { cambio: fila });
+        }
+        directos.datos_json = JSON.stringify(Object.assign({}, actuales, v.datos));
+        aplicados.push('datos');
+      }
+    }
+
     for (const campo of Object.keys(campos)) {
+      if (campo === 'datos') continue;       // ya resuelto arriba
       let nuevo = norm(campos[campo]);
       let anterior = norm(eq[campo]);
       if (campo === 'empresa') {
