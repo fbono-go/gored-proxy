@@ -104,6 +104,19 @@ function aplicarEn(d, cambios) {
     else { d.cambios.push(cambios.cambio); d.porCambio.set(id, cambios.cambio); }
   }
 
+  if (cambios.auditoria) {
+    const id = norm(cambios.auditoria.auditoria_id);
+    const actual = d.porAuditoria.get(id);
+    if (actual) {
+      Object.assign(actual, cambios.auditoria);
+    } else if (cambios.auditoria.equipo_id) {
+      // una actualización parcial de una fila que la relectura todavía no trae
+      // no se agrega sola: quedaría una fila sin equipo
+      d.auditorias.push(cambios.auditoria);
+      d.porAuditoria.set(id, cambios.auditoria);
+    }
+  }
+
   if (cambios.intervencion) {
     const id = norm(cambios.intervencion.intervencion_id);
     if (!d.porIntervencion.has(id)) {     // al re-aplicar puede que ya venga en la lectura
@@ -153,6 +166,9 @@ function releer() {
         correctivos: r.correctivos || [],
         intervenciones: r.intervenciones || [],
         cambios: r.cambios || [],
+        // sin la hoja nueva en la planilla, la auditoría queda apagada
+        auditorias: r.auditorias || [],
+        config_auditoria: r.config_auditoria || [],
       });
       const pendientes = cache.pendientes || [];
       cache.pendientes = null;
@@ -204,6 +220,9 @@ function indexar(d) {
 
   d.porCambio = new Map();
   for (const c of (d.cambios || [])) d.porCambio.set(norm(c.cambio_id), c);
+
+  d.porAuditoria = new Map();
+  for (const a of (d.auditorias || [])) d.porAuditoria.set(norm(a.auditoria_id), a);
 
   d.checklists = new Map();     // se llena por demanda, memoizado
   d.tiposInfo = new Map();
@@ -549,6 +568,10 @@ function normalizarCampo(c) {
     repetir_por: norm(c.repetir_por),
     ayuda: norm(c.ayuda),
     dispara,
+    // auditoría: si un oficial puede verificar esta pregunta, y cuánta
+    // diferencia admite entre dos mediciones (vacío = la general)
+    auditable: esSi(c.auditable),
+    tolerancia: num(c.tolerancia_pct),
     orden: num(c.orden) ?? 999,
   };
 }
@@ -1368,6 +1391,8 @@ function vistaCatalogo(d) {
       cat_ticket_id: num(t.cat_ticket_id),
       subcat_ticket_id: num(t.subcat_ticket_id),
       posicion_etiqueta: norm(t.posicion_etiqueta || t.posicion_de_la_etiqueta),
+      auditoria_activa: esSi(t.auditoria_activa),
+      auditoria_pct: num(t.auditoria_pct),
       activo: esSi(t.activo),
       equipos: equiposDe(d, new Set([id])),         // con etiqueta de este tipo
       equipos_afectados: equiposDe(d, usan),         // a los que llega un cambio de sus preguntas
@@ -1390,6 +1415,8 @@ function vistaCatalogo(d) {
       autocompletable: n.autocompletable,
       repetir_por: n.repetir_por,
       ayuda: n.ayuda,
+      auditable: n.auditable,
+      tolerancia: n.tolerancia,
       orden: n.orden,
       activo: esSi(c.activo),
       cuando_avisa: textoRegla(c),
@@ -1405,6 +1432,9 @@ function vistaCatalogo(d) {
     campos: filas.filter((c) => !c.alta),
     alta: filas.filter((c) => c.alta),
     alta_lista: d.tipos_campos.some((c) => 'momento' in c) && hayColumnaDatos(d),
+    // sin las dos columnas en la planilla el editor no ofrece auditar
+    auditoria_lista: d.catalogo_tipos.some((t) => 'auditoria_activa' in t) &&
+      d.tipos_campos.some((c) => 'auditable' in c),
     refs: REFS_EQUIPO,
   };
 }
@@ -1847,6 +1877,15 @@ function montarPreventivo(app, opciones) {
     });
   };
 
+  // Auditoría de preventivos: módulo aparte. Se le pasa lo que necesita de acá
+  // para no tener dependencias circulares.
+  const auditoria = require('./auditoria').crear({
+    norm, num, esSi, datos, llamarSheets, aplicarLocal, ahoraLocal, HOY, sumarDias, diasEntre,
+    uuidV4, referencia, checklistDe, expandirPara, valorDe, evaluarDisparos, filaTipo, filaCampo,
+    equipoConEstado, terminalesBajo, vistaCatalogo, guardarCatalogo, sinVersion, authAdmin,
+    actual: () => cache.datos,
+  });
+
   // --- diagnóstico -------------------------------------------------------
   app.get(`${base}/salud`, asinc(async (req, res) => {
     const d = await datos(false);
@@ -2228,6 +2267,18 @@ function montarPreventivo(app, opciones) {
       };
       await llamarSheets({ accion: 'correctivo', correctivo });
       aplicarLocal(d, { correctivo });
+    }
+
+    // Auditoría: se decide después de guardar y SIN esperar. Si falla, el
+    // preventivo ya quedó escrito: el dato del técnico vale más que la muestra.
+    if (!r.duplicado) {
+      auditoria.alRegistrar(d, {
+        eq, info, checklist, respuestas, uuid, fecha,
+        rol: norm(p.rol).toLowerCase(),
+        proveedor: registro.proveedor,
+        gpsOk: p.gps_ok === undefined ? null : !!p.gps_ok,
+        cantFotos,
+      }).catch((e) => console.error('[auditoria] no se pudo anotar:', e && e.message));
     }
 
     res.json({
@@ -3173,6 +3224,7 @@ function montarPreventivo(app, opciones) {
   }));
 
   montarAdmin(app, base, asinc);
+  auditoria.montarRutas(app, base, auth, asinc);
 
   console.log(`[preventivo] montado en ${base}`);
   return app;
