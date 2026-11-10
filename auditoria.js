@@ -72,14 +72,34 @@ function crear(c) {
 
   // ============================================================ configuración
 
-  function config(d) {
+  /**
+   * Valores vigentes. Capas: los de fábrica, los generales (clave `tope_semanal`)
+   * y, si se pide una institución, los suyos (clave `tope_semanal@2`). Un valor
+   * vacío en la planilla no pisa nada: así una institución «vuelve al general».
+   */
+  function config(d, inst) {
     const cfg = Object.assign({}, DEF);
-    for (const f of (d.config_auditoria || [])) {
-      const k = norm(f.clave);
-      const v = num(f.valor);
-      if (k in DEF && v !== null && v >= 0) cfg[k] = v;
-    }
+    const filas = d.config_auditoria || [];
+    const aplicar = (sufijo) => {
+      for (const f of filas) {
+        const [k, i = ''] = norm(f.clave).split('@');
+        const v = num(f.valor);
+        if (k in DEF && i === sufijo && v !== null && v >= 0) cfg[k] = v;
+      }
+    };
+    aplicar('');
+    if (inst) aplicar(String(inst));
     return cfg;
+  }
+
+  /** Claves que una institución tiene propias (para mostrar «usa el general»). */
+  function propias(d, inst) {
+    const out = {};
+    for (const f of (d.config_auditoria || [])) {
+      const [k, i = ''] = norm(f.clave).split('@');
+      if (inst && i === String(inst) && k in DEF && num(f.valor) !== null) out[k] = num(f.valor);
+    }
+    return out;
   }
 
   /** Sin las columnas nuevas en la planilla, todo el módulo queda apagado. */
@@ -122,7 +142,7 @@ function crear(c) {
       (norm(a.equipo_id).toUpperCase() === equipoId && ABIERTAS.includes(norm(a.estado))));
     if (repetida) return null;          // reintento de la cola, o ya hay una abierta
 
-    const cfg = config(d);
+    const cfg = config(d, num(x.eq.institucion_id));
     const pct = num(c.filaTipo(d, x.info.tipo_id).auditoria_pct) ?? cfg.pct_azar;
     const criticidad = norm(x.eq.criticidad).toLowerCase() || 'normal';
 
@@ -191,31 +211,40 @@ function crear(c) {
     const enCola = d.auditorias.filter((a) => norm(a.estado) === 'en_cola');
     if (!enCola.length) return;
 
-    const cfg = config(d);
     const hoy = c.HOY();
     const semana = lunesDe(hoy);
     const filas = [];
 
-    const vivas = [];
+    // Cada institución tiene su propio cupo: sus oficiales son los que se saturan.
+    const porInst = new Map();
     for (const a of enCola) {
-      if (c.diasEntre(norm(a.fecha_preventivo).slice(0, 10), hoy) > cfg.caduca_cola_dias) {
-        filas.push({ auditoria_id: a.auditoria_id, estado: 'caducada' });
-      } else {
-        vivas.push(a);
-      }
+      const k = num(a.institucion_id) ?? '';
+      if (!porInst.has(k)) porInst.set(k, []);
+      porInst.get(k).push(a);
     }
-
-    const cupo = cfg.tope_semanal - d.auditorias.filter((a) => norm(a.semana_liberada) === semana).length;
-    vivas.sort((a, b) => (num(a.prioridad) - num(b.prioridad)) ||
-      norm(a.fecha_preventivo).localeCompare(norm(b.fecha_preventivo)));
-    for (const a of vivas.slice(0, Math.max(0, cupo))) {
-      filas.push({
-        auditoria_id: a.auditoria_id,
-        estado: 'pendiente',
-        semana_liberada: semana,
-        fecha_liberada: c.ahoraLocal(),
-        vence: c.sumarDias(hoy, cfg.plazo_dias),
-      });
+    for (const [inst, cola] of porInst) {
+      const cfg = config(d, inst);
+      const vivas = [];
+      for (const a of cola) {
+        if (c.diasEntre(norm(a.fecha_preventivo).slice(0, 10), hoy) > cfg.caduca_cola_dias) {
+          filas.push({ auditoria_id: a.auditoria_id, estado: 'caducada' });
+        } else {
+          vivas.push(a);
+        }
+      }
+      const cupo = cfg.tope_semanal - d.auditorias.filter((a) =>
+        norm(a.semana_liberada) === semana && (num(a.institucion_id) ?? '') === inst).length;
+      vivas.sort((a, b) => (num(a.prioridad) - num(b.prioridad)) ||
+        norm(a.fecha_preventivo).localeCompare(norm(b.fecha_preventivo)));
+      for (const a of vivas.slice(0, Math.max(0, cupo))) {
+        filas.push({
+          auditoria_id: a.auditoria_id,
+          estado: 'pendiente',
+          semana_liberada: semana,
+          fecha_liberada: c.ahoraLocal(),
+          vence: c.sumarDias(hoy, cfg.plazo_dias),
+        });
+      }
     }
     await guardar(d, filas);
   }
@@ -425,7 +454,7 @@ function crear(c) {
         return res.status(400).json({ ok: false, error: 'Faltan campos requeridos', faltan });
       }
 
-      const cfg = config(d);
+      const cfg = config(d, num(a.institucion_id));
       const cmp = comparar(campos, declarado, respuestas, eq, cfg, parse(a.declarado_desvios_json, []));
       const hoy = c.HOY();
       const fila = {
@@ -458,26 +487,36 @@ function crear(c) {
       if (!habilitada(d)) return res.json({ ok: true, habilitada: false });
       await liberar(d);
 
-      const cfg = config(d);
+      // Con una institución elegida se ve y se configura solo lo suyo; sin ella,
+      // el conjunto con los valores generales.
+      const inst = num(req.query.institucion);
+      const cfg = config(d, inst);
       const hoy = c.HOY();
       const semana = lunesDe(hoy);
-      const delaSemana = d.auditorias.filter((a) => norm(a.semana_liberada) === semana);
-      const realizadas = d.auditorias.filter((a) => norm(a.estado) === 'realizada')
+      const suyas = inst ? d.auditorias.filter((a) => num(a.institucion_id) === inst) : d.auditorias;
+      const delaSemana = suyas.filter((a) => norm(a.semana_liberada) === semana);
+      const realizadas = suyas.filter((a) => norm(a.estado) === 'realizada')
         .sort((a, b) => norm(b.fecha_auditoria).localeCompare(norm(a.fecha_auditoria)));
 
       res.json({
         ok: true,
         habilitada: true,
         config: cfg,
+        institucion: inst || null,
+        general: config(d),                    // lo que usa quien no tiene valores propios
+        propia: propias(d, inst),
         semana: {
           desde: semana,
           liberadas: delaSemana.length,
           hechas: delaSemana.filter((a) => norm(a.estado) === 'realizada').length,
-          tope: cfg.tope_semanal,
+          // sin filtro: la suma de los cupos de las instituciones que tienen auditorías
+          tope: inst ? cfg.tope_semanal
+            : [...new Set(suyas.map((a) => num(a.institucion_id) ?? ''))]
+              .reduce((t, i) => t + config(d, i).tope_semanal, 0) || cfg.tope_semanal,
         },
-        en_cola: d.auditorias.filter((a) => norm(a.estado) === 'en_cola').length,
-        pendientes: d.auditorias.filter((a) => norm(a.estado) === 'pendiente').length,
-        proveedores: calificar(d, cfg),
+        en_cola: suyas.filter((a) => norm(a.estado) === 'en_cola').length,
+        pendientes: suyas.filter((a) => norm(a.estado) === 'pendiente').length,
+        proveedores: calificar({ auditorias: suyas, catalogo_tipos: d.catalogo_tipos }, cfg),
         // lo que no salió conforme y nadie miró todavía
         para_revisar: realizadas.filter((a) => norm(a.resultado) !== 'conforme' && !norm(a.revision_estado))
           .slice(0, 50).map(completa),
@@ -509,15 +548,23 @@ function crear(c) {
       const d = await c.datos(false);
       if (!d.catalogo_tipos.length) return mal(res, 503, 'La planilla no respondió, reintentá');
 
+      // `institucion` guarda los valores de esa institución (clave `tope_semanal@2`);
+      // sin ella son los generales. Vacío = volver al general (solo con institución).
+      const inst = num(p.institucion);
+      if (p.institucion !== undefined && p.institucion !== '' && p.institucion !== null && (inst === null || inst < 1)) {
+        return mal(res, 400, 'Institución inválida');
+      }
+      const sufijo = inst ? `@${inst}` : '';
       const filas = [];
       for (const k of Object.keys(LIMITES)) {
         if (!(k in p)) continue;
+        if (inst && (p[k] === '' || p[k] === null)) { filas.push({ clave: k + sufijo, valor: '' }); continue; }
         const v = num(p[k]);
         const [lo, hi] = LIMITES[k];
         if (v === null || !Number.isInteger(v) || v < lo || v > hi) {
           return mal(res, 400, `${ETIQUETA_CONFIG[k]}: un número entero de ${lo} a ${hi}`);
         }
-        filas.push({ clave: k, valor: v });
+        filas.push({ clave: k + sufijo, valor: v });
       }
       if (!filas.length) return mal(res, 400, 'No hay nada para guardar');
 
@@ -528,7 +575,7 @@ function crear(c) {
       }
       // un tope más alto libera enseguida lo que estaba esperando
       liberar(d).catch((e) => console.error('[auditoria] liberar:', e.message));
-      res.json({ ok: true, config: config(d) });
+      res.json({ ok: true, config: config(d, inst) });
     }));
 
     // --- qué se audita: interruptor por tipo y marca por pregunta -----------
