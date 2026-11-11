@@ -592,6 +592,8 @@ function normalizarCampo(c) {
     tolerancia: num(c.tolerancia_pct),
     orden: num(c.orden) ?? 999,
     nivel: nivelDeCampo(c),
+    // la lectura del horómetro: alimenta el ritmo de uso del equipo
+    es_horometro: esSi(c.es_horometro) || norm(c.campo_id).toLowerCase() === 'horometro',
   };
 }
 
@@ -1185,6 +1187,63 @@ const ORDEN_SEMAFORO = { rojo: 3, amarillo: 2, gris: 1, verde: 0 };
  * cómo quedaría después de un registro, antes de escribirlo.
  * Sin plan: un solo nivel que sale de la fila `estado`, igual que siempre.
  */
+// ── horas de uso ─────────────────────────────────────────────────────────────
+// El oficial lee el horómetro en el preventivo mensual. Con dos lecturas se saca
+// cuántas horas por día trabaja el equipo, y de ahí cuándo llegará a las horas
+// que pide un nivel. El vencimiento real es el que llegue primero: días u horas.
+const VENTANA_MIN_RITMO = 7;      // días mínimos entre lecturas para recalcular el ritmo
+const TOPE_HORAS_DIA = 24;
+
+/** Horas de uso estimadas hoy, a partir de la última lectura y el ritmo. null si no hay datos. */
+function horasEstimadas(eq, est, hoy) {
+  const h = num(est && est.horas_ultima);
+  const f = norm(est && est.horas_fecha).slice(0, 10);
+  if (h === null || !f) return null;
+  const ritmo = ritmoDe(eq, est);
+  const dias = Math.max(0, diasEntre(f, hoy) || 0);
+  return h + (ritmo || 0) * dias;
+}
+
+/** Horas por día: la medida si la hay, si no la estimada al dar de alta. */
+function ritmoDe(eq, est) {
+  const r = num(est && est.ritmo_h_dia);
+  if (r !== null && r > 0) return r;
+  const e = num(eq && eq.horas_dia_est);
+  return e !== null && e > 0 ? e : null;
+}
+
+/**
+ * Estado de horas después de una nueva lectura. Devuelve las columnas de `estado`
+ * que cambian. El ritmo solo se recalcula con lecturas separadas por una semana o
+ * más; con menos, un día raro (equipo parado) lo desarmaría.
+ */
+function horasConLectura(eq, est, lectura, fechaDia) {
+  est = est || {};
+  const previaH = num(est.horas_ultima);
+  const previaF = norm(est.horas_fecha).slice(0, 10);
+  let ritmo = num(est.ritmo_h_dia);
+  if (previaH !== null && previaF && fechaDia > previaF && lectura >= previaH) {
+    const dias = diasEntre(previaF, fechaDia);
+    if (dias >= VENTANA_MIN_RITMO) ritmo = Math.min(TOPE_HORAS_DIA, (lectura - previaH) / dias);
+  }
+  return {
+    horas_ultima: lectura,
+    horas_fecha: fechaDia,
+    ritmo_h_dia: ritmo !== null ? Math.round(ritmo * 100) / 100 : '',
+  };
+}
+
+/** Fecha en que se llegará a las horas del nivel, o null si no se puede calcular. */
+function vencimientoPorHoras(p, fila, eq, est, hoy) {
+  if (!p.cada_horas || !fila) return null;
+  const base = num(fila.horas_en_ultimo);
+  const ahora = horasEstimadas(eq, est, hoy);
+  const ritmo = ritmoDe(eq, est);
+  if (base === null || ahora === null || !ritmo) return null;
+  const restan = p.cada_horas - (ahora - base);
+  return restan <= 0 ? hoy : sumarDias(hoy, Math.ceil(restan / ritmo));
+}
+
 function estadosNiveles(d, eq, est, forzados, plan) {
   plan = plan || planDe(d, eq);
   const real = planEsReal(plan);
@@ -1192,7 +1251,7 @@ function estadosNiveles(d, eq, est, forzados, plan) {
   est = est || {};
   return plan.map((p, i) => {
     const primero = i === 0;
-    let ultimo, proximo;
+    let ultimo, proximo, porUso = false;
     if (!real) {
       ultimo = norm(est.ultimo_preventivo);
       proximo = norm(est.proximo_venc);
@@ -1203,6 +1262,8 @@ function estadosNiveles(d, eq, est, forzados, plan) {
       ultimo = fila ? norm(fila.ultimo_fecha).slice(0, 10) : (primero ? norm(est.ultimo_preventivo) : '');
       if (ultimo) {
         proximo = sumarDias(ultimo, p.cada_dias);
+        const porHoras = vencimientoPorHoras(p, fila, eq, est, hoy);
+        if (porHoras && porHoras < proximo) { proximo = porHoras; porUso = true; }
       } else {
         proximo = (fila && norm(fila.base_venc).slice(0, 10)) ||
           (primero ? norm(est.proximo_venc) : '') ||
@@ -1214,6 +1275,8 @@ function estadosNiveles(d, eq, est, forzados, plan) {
       nombre: p.nombre,
       responsable: p.responsable,
       cada_dias: p.cada_dias,
+      cada_horas: p.cada_horas,
+      por_uso: porUso,
       aviso_dias: p.aviso_dias,
       duracion_min: p.duracion_min,
       ultimo,
@@ -1660,6 +1723,7 @@ function vistaCatalogo(d) {
       tolerancia: n.tolerancia,
       orden: n.orden,
       nivel: n.nivel,
+      es_horometro: n.es_horometro,
       activo: esSi(c.activo),
       cuando_avisa: textoRegla(c),
       regla: reglaParaEditor(textoRegla(c)),
@@ -1676,6 +1740,8 @@ function vistaCatalogo(d) {
     planes: [...d.porPlan].map(([tipo_id, niveles]) => ({ tipo_id, niveles: niveles.map(planParaCliente) })),
     // sin la columna «nivel» el creador puede guardar el plan, pero no repartir preguntas
     niveles_lista: d.tipos_campos.some((c) => 'nivel' in c),
+    // sin las columnas de horas el plan no puede vencer por uso
+    horas_lista: d.tipos_campos.some((c) => 'es_horometro' in c),
     alta_lista: d.tipos_campos.some((c) => 'momento' in c) && hayColumnaDatos(d),
     // sin las dos columnas en la planilla el editor no ofrece auditar
     auditoria_lista: d.catalogo_tipos.some((t) => 'auditoria_activa' in t) &&
@@ -2018,6 +2084,13 @@ function montarAdmin(app, base, asinc) {
       fila.nivel = t === 'todos' ? 'todos' : (n !== null && n >= 1 ? Math.floor(n) : '');
     }
 
+    // la pregunta que es la lectura del horómetro: tiene que ser un número
+    if (!alta && p.es_horometro !== undefined) {
+      const tc = norm(fila.tipo_campo || (existente && existente.tipo_campo));
+      if (p.es_horometro && tc !== 'numero') return mal(res, 400, 'La lectura del horómetro tiene que ser una pregunta de tipo número');
+      fila.es_horometro = p.es_horometro ? 'SI' : 'NO';
+    }
+
     if (existente) {
       fila.campo_id = norm(existente.campo_id);
     } else {
@@ -2096,13 +2169,17 @@ function montarAdmin(app, base, asinc) {
       const cubre = nada ? null : listaNiveles(cubreTxt);
       if (cubre && cubre.some((n) => n >= nivel)) return mal(res, 400, `El nivel ${nivel} solo puede cubrir niveles menores`);
       const dur = num(x.duracion_min);
+      const horas = num(x.cada_horas);
+      if (horas !== null && (!Number.isInteger(horas) || horas < 1 || horas > 100000)) {
+        return mal(res, 400, `El nivel ${nivel}: las horas de uso tienen que ser un número entero entre 1 y 100000`);
+      }
       anterior = { nombre, cada_dias: cada };
       filas.push({
         tipo_id: tipoId,
         nivel,
         nombre_nivel: nombre,
         cada_dias: cada,
-        cada_horas: '',
+        cada_horas: horas !== null ? horas : '',
         responsable,
         hereda_checklist: x.hereda ? 'SI' : 'NO',
         cubre: nada ? 'nada' : (cubre ? cubre.join(';') : ''),
@@ -2594,7 +2671,21 @@ function montarPreventivo(app, opciones) {
       gps_lon: num(p.gps_lon) ?? '',
     };
 
-    const estadoPrevio = d.porEstado.get(equipoId) || {};
+    let estadoPrevio = d.porEstado.get(equipoId) || {};
+
+    // Horómetro: si el checklist lo pide y vino la lectura, se recalcula el ritmo
+    // de uso. Un registro viejo (cola offline) no pisa una lectura más nueva.
+    const campoHoras = checklist.find((c) => c.es_horometro);
+    const lectura = campoHoras ? num(respuestas[campoHoras.campo_id]) : null;
+    let horasNuevas = null;
+    if (lectura !== null && lectura >= 0) {
+      registro.horas_uso = lectura;
+      const fHoras = norm(estadoPrevio.horas_fecha).slice(0, 10);
+      if (!fHoras || fechaDia >= fHoras) {
+        horasNuevas = horasConLectura(eq, estadoPrevio, lectura, fechaDia);
+        estadoPrevio = Object.assign({}, estadoPrevio, horasNuevas);
+      }
+    }
 
     // Con niveles: hacer uno deja cumplidos los menores. Cada nivel solo avanza si
     // el registro es más nuevo que lo que ya tiene (la cola offline llega desordenada).
@@ -2617,6 +2708,8 @@ function montarPreventivo(app, opciones) {
           clave: claveNivel(equipoId, n), equipo_id: equipoId, nivel: n,
           ultimo_fecha: fechaDia, ultimo_usuario: norm(p.usuario),
           base_venc: previa ? norm(previa.base_venc).slice(0, 10) : '',
+          // lectura del horómetro al cumplir el nivel: desde ahí se cuentan sus horas
+          horas_en_ultimo: lectura !== null ? lectura : '',
           proximo_venc: sumarDias(fechaDia, plan.find((x) => x.nivel === n).cada_dias),
           actualizado: ahoraLocal(),
         };
@@ -2641,6 +2734,10 @@ function montarPreventivo(app, opciones) {
       proximo_venc: resumen ? resumen.peor.proximo_venc : proximo,
       semaforo: resumen ? resumen.peor.semaforo : semaforoDe(proximo, fechaDia),
       ...(resumen ? { nivel_pendiente: resumen.peor.nivel } : {}),
+      // la fila de estado se reescribe entera: las horas viajan siempre
+      horas_ultima: estadoPrevio.horas_ultima ?? '',
+      horas_fecha: estadoPrevio.horas_fecha ?? '',
+      ritmo_h_dia: estadoPrevio.ritmo_h_dia ?? '',
       ultimo_resultado: desvios.length ? 'desvio' : 'conforme',
       desvios_json: desvios.length ? JSON.stringify(desvios) : norm(estadoPrevio.desvios_json),
       // Un desvío deja el ticket EN BANDEJA: nunca entra solo al circuito.
@@ -2658,6 +2755,7 @@ function montarPreventivo(app, opciones) {
         proximo_venc: resumen.peor.proximo_venc,
         semaforo: resumen.peor.semaforo,
         nivel_pendiente: resumen.peor.nivel,
+        ...(horasNuevas || {}),
         actualizado: ahoraLocal(),
       });
       delete estado._fila;
@@ -3765,6 +3863,6 @@ module.exports = {
     reglaATexto, reglaParaEditor, slug, tiposQueUsan, cadenaDe, vistaCatalogo,
     empresaDe, claveEmpresa, ajenoParaProveedor, valoresDeEmpresa,
     equipoConEstado, planDe, estadosNiveles, nivelesCubiertos, checklistNivel, normalizarPlan,
-    indexar,
+    indexar, horasConLectura, vencimientoPorHoras, horasEstimadas, ritmoDe,
   },
 };
