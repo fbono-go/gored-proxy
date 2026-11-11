@@ -125,6 +125,17 @@ function aplicarEn(d, cambios) {
     }
   }
 
+  for (const n of (cambios.estados_niveles || [])) {
+    const id = norm(n.clave).toUpperCase();
+    const actual = d.porNivel.get(id);
+    if (actual) {
+      Object.assign(actual, n);
+    } else {
+      (d.estado_niveles = d.estado_niveles || []).push(n);
+      d.porNivel.set(id, n);
+    }
+  }
+
   if (cambios.estado) {
     const id = norm(cambios.estado.equipo_id).toUpperCase();
     const actual = d.porEstado.get(id);
@@ -169,6 +180,9 @@ function releer() {
         // sin la hoja nueva en la planilla, la auditoría queda apagada
         auditorias: r.auditorias || [],
         config_auditoria: r.config_auditoria || [],
+        // sin las hojas de niveles todo equipo sigue con su único preventivo
+        planes: r.planes || [],
+        estado_niveles: r.estado_niveles || [],
       });
       const pendientes = cache.pendientes || [];
       cache.pendientes = null;
@@ -223,6 +237,10 @@ function indexar(d) {
 
   d.porAuditoria = new Map();
   for (const a of (d.auditorias || [])) d.porAuditoria.set(norm(a.auditoria_id), a);
+
+  d.porNivel = new Map();
+  for (const n of (d.estado_niveles || [])) d.porNivel.set(norm(n.clave).toUpperCase(), n);
+  indexarPlanes(d);
 
   d.checklists = new Map();     // se llena por demanda, memoizado
   d.tiposInfo = new Map();
@@ -573,7 +591,21 @@ function normalizarCampo(c) {
     auditable: esSi(c.auditable),
     tolerancia: num(c.tolerancia_pct),
     orden: num(c.orden) ?? 999,
+    nivel: nivelDeCampo(c),
   };
+}
+
+/**
+ * En qué nivel de preventivo aparece una pregunta: un número, «todos», o vacío = 1.
+ * Las fotos y las observaciones cierran cualquier checklist: son de todos los niveles.
+ */
+function nivelDeCampo(c) {
+  const t = norm(c.nivel).toLowerCase();
+  if (t === 'todos') return 'todos';
+  const n = num(t);
+  if (n !== null && n >= 1) return Math.floor(n);
+  if (norm(c.tipo_campo).toLowerCase() === 'foto' || norm(c.campo_id) === CAMPO_OBSERVACIONES) return 'todos';
+  return 1;
 }
 
 /**
@@ -1031,11 +1063,16 @@ function periodicidadDe(d, equipo) {
  * Con preventivo pero sin fecha no hay forma de saber cuándo toca: rojo.
  */
 function semaforoDe(proximoVenc, ultimoPreventivo) {
-  if (!ultimoPreventivo) return 'gris';
+  return semaforoNivel(proximoVenc, ultimoPreventivo, DIAS_AMARILLO, true);
+}
+
+/** Igual que semaforoDe, con el aviso propio del nivel; `gris`: ¿sin historia cuenta como gris? */
+function semaforoNivel(proximoVenc, ultimoPreventivo, aviso, gris) {
+  if (!ultimoPreventivo && gris) return 'gris';
   if (!proximoVenc) return 'rojo';
   const faltan = diasEntre(HOY(), proximoVenc);
   if (faltan === null || faltan < 0) return 'rojo';
-  if (faltan <= DIAS_AMARILLO) return 'amarillo';
+  if (faltan <= aviso) return 'amarillo';
   return 'verde';
 }
 
@@ -1046,16 +1083,213 @@ function sePuedeAdelantar(proximoVenc, periodicidad) {
   return faltan <= Math.round(periodicidad * VENTANA_ADELANTO);
 }
 
+// ============================================================ niveles de preventivo
+
+/**
+ * Un tipo de equipo puede tener un PLAN de varios niveles (mensual, anual, mayor...),
+ * cada uno con su propio reloj, su responsable (personal propio o empresa) y su
+ * checklist. Un tipo sin plan se comporta exactamente como antes: un único nivel
+ * "sintético" con la periodicidad y el responsable del equipo.
+ *
+ * Reglas:
+ *  - Hacer un nivel deja cumplidos los menores (los que diga `cubre`; vacío = todos
+ *    los menores). Nunca al revés: el mensual no corre el anual.
+ *  - El vencimiento de un nivel es su última fecha + cada_dias. Se calcula al leer,
+ *    no se guarda: cambiar el plan se aplica en el acto. Mientras nunca se hizo, vale
+ *    la primera fecha repartida (base_venc).
+ *  - La empresa es de cada equipo (equipos.empresa), no del tipo ni del nivel.
+ */
+
+const claveNivel = (equipoId, nivel) => `${norm(equipoId).toUpperCase()}|${nivel}`;
+
+/** "1;2" / "1, 2" → [1, 2]. Vacío → null (= todos los menores). */
+function listaNiveles(txt) {
+  const l = norm(txt).split(/[;,|\s]+/).map(num).filter((n) => n !== null && n >= 1);
+  return l.length ? l : null;
+}
+
+/** Una fila de la hoja `planes` → nivel de plan. Devuelve null si no sirve o está dado de baja. */
+function normalizarPlan(f) {
+  if (norm(f.activo) !== '' && !esSi(f.activo)) return null;
+  const nivel = num(f.nivel);
+  const cada = num(f.cada_dias);
+  if (!nivel || nivel < 1 || !cada || cada < 1) return null;
+  return {
+    nivel: Math.floor(nivel),
+    nombre: norm(f.nombre_nivel) || `Nivel ${Math.floor(nivel)}`,
+    cada_dias: Math.round(cada),
+    cada_horas: num(f.cada_horas),
+    responsable: norm(f.responsable).toLowerCase() === 'externo' ? 'externo' : 'oficial',
+    hereda: esSi(f.hereda_checklist),
+    // «nada»: hacer este nivel no deja cumplido ninguno otro (lista vacía)
+    cubre: norm(f.cubre).toLowerCase() === 'nada' ? [] : listaNiveles(f.cubre),
+    aviso_dias: num(f.aviso_dias) ?? DIAS_AMARILLO,
+    duracion_min: num(f.duracion_min),
+    desde: norm(f.desde).slice(0, 10),
+  };
+}
+
+/** Índices de planes por tipo. Se rehace al leer la planilla y al guardar un plan. */
+function indexarPlanes(d) {
+  d.porPlan = new Map();
+  for (const f of (d.planes || [])) {
+    const p = normalizarPlan(f);
+    if (!p) continue;
+    const tipo = norm(f.tipo_id);
+    if (!d.porPlan.has(tipo)) d.porPlan.set(tipo, []);
+    d.porPlan.get(tipo).push(p);
+  }
+  for (const lista of d.porPlan.values()) lista.sort((a, b) => a.nivel - b.nivel);
+}
+
+/** Niveles del equipo: los del plan de su tipo, o un único nivel con lo de siempre. */
+function planDe(d, eq) {
+  const real = d.porPlan && d.porPlan.get(norm(eq.tipo || eq.tipo_id));
+  if (real && real.length) return real;
+  return [{
+    nivel: 1, nombre: 'Preventivo', cada_dias: periodicidadDe(d, eq), cada_horas: null,
+    responsable: norm(eq.responsable).toLowerCase() === 'externo' ? 'externo' : 'oficial',
+    hereda: true, cubre: null, aviso_dias: DIAS_AMARILLO, duracion_min: null, desde: '',
+    sintetico: true,
+  }];
+}
+const planEsReal = (plan) => !plan[0].sintetico;
+
+const tieneNivelExterno = (d, e) => !!(d && d.porPlan &&
+  (d.porPlan.get(norm(e.tipo || e.tipo_id)) || []).some((p) => p.responsable === 'externo'));
+
+/** Qué niveles quedan cumplidos al hacer `nivel`. */
+function nivelesCubiertos(plan, nivel) {
+  const p = plan.find((x) => x.nivel === nivel);
+  const menores = plan.filter((x) => x.nivel < nivel).map((x) => x.nivel);
+  return p && p.cubre ? menores.filter((n) => p.cubre.includes(n)) : menores;
+}
+
+/** Preguntas de un nivel. Sube con `hereda`; las de «todos» (y fotos/observaciones) van siempre. */
+function checklistNivel(checklist, p) {
+  return checklist.filter((c) => c.nivel === 'todos' || (p.hereda ? c.nivel <= p.nivel : c.nivel === p.nivel));
+}
+
+/** Checklist (ya expandido para el equipo) del nivel pedido. Sin plan: el de siempre. */
+function checklistParaNivel(d, eq, plan, nivel) {
+  const base = checklistDe(d, norm(eq.tipo || eq.tipo_id));
+  if (!planEsReal(plan)) return expandirPara(base, eq);
+  const p = plan.find((x) => x.nivel === nivel) || plan[0];
+  return expandirPara(checklistNivel(base, p), eq);
+}
+
+const ORDEN_SEMAFORO = { rojo: 3, amarillo: 2, gris: 1, verde: 0 };
+
+/**
+ * Estado de cada nivel de un equipo. `forzados` (Map nivel → fila) permite ver
+ * cómo quedaría después de un registro, antes de escribirlo.
+ * Sin plan: un solo nivel que sale de la fila `estado`, igual que siempre.
+ */
+function estadosNiveles(d, eq, est, forzados, plan) {
+  plan = plan || planDe(d, eq);
+  const real = planEsReal(plan);
+  const hoy = HOY();
+  est = est || {};
+  return plan.map((p, i) => {
+    const primero = i === 0;
+    let ultimo, proximo;
+    if (!real) {
+      ultimo = norm(est.ultimo_preventivo);
+      proximo = norm(est.proximo_venc);
+    } else {
+      const fila = (forzados && forzados.get(p.nivel)) ||
+        (d.porNivel && d.porNivel.get(claveNivel(eq.equipo_id, p.nivel)));
+      // el primer nivel de un equipo anterior al plan arranca de su historia (estado)
+      ultimo = fila ? norm(fila.ultimo_fecha).slice(0, 10) : (primero ? norm(est.ultimo_preventivo) : '');
+      if (ultimo) {
+        proximo = sumarDias(ultimo, p.cada_dias);
+      } else {
+        proximo = (fila && norm(fila.base_venc).slice(0, 10)) ||
+          (primero ? norm(est.proximo_venc) : '') ||
+          primerVencimiento(eq, p.cada_dias, p.desde || norm(eq.alta_fecha).slice(0, 10) || hoy);
+      }
+    }
+    return {
+      nivel: p.nivel,
+      nombre: p.nombre,
+      responsable: p.responsable,
+      cada_dias: p.cada_dias,
+      aviso_dias: p.aviso_dias,
+      duracion_min: p.duracion_min,
+      ultimo,
+      proximo_venc: proximo,
+      // sin ninguna vez hecho, solo el primer nivel es «gris» (primer relevamiento);
+      // un nivel mayor que nunca se hizo vence cuando le toca
+      semaforo: semaforoNivel(proximo, ultimo, p.aviso_dias, primero),
+      dias_restantes: proximo ? diasEntre(hoy, proximo) : null,
+      adelantable: proximo ? sePuedeAdelantar(proximo, p.cada_dias) : false,
+    };
+  });
+}
+
+/** ¿Este nivel le toca a quien pregunta? alcance: oficial | externo | todos | nombre de empresa. */
+function nivelEnAlcance(nivelResponsable, empresaClave, alcance) {
+  const a = claveEmpresa(alcance);
+  if (!a || a === 'todos') return true;
+  if (a === 'oficial') return nivelResponsable === 'oficial';
+  if (a === 'externo') return nivelResponsable === 'externo';
+  return nivelResponsable === 'externo' && empresaClave === a;
+}
+
+/**
+ * De varios niveles, cuál es el más urgente (el que pinta el semáforo) y cuál
+ * se ofrece al escanear: el MAYOR de los que están vencidos, por vencer o
+ * adelantables —hacerlo deja cumplidos los menores—; si no hay, el menor.
+ */
+function resumenNiveles(niveles) {
+  const peor = niveles.reduce((a, b) => {
+    const ra = ORDEN_SEMAFORO[a.semaforo];
+    const rb = ORDEN_SEMAFORO[b.semaforo];
+    if (ra !== rb) return rb > ra ? b : a;
+    return (b.dias_restantes ?? 1e9) < (a.dias_restantes ?? 1e9) ? b : a;
+  });
+  const pedibles = niveles.filter((n) => n.semaforo === 'rojo' || n.semaforo === 'amarillo' || n.adelantable);
+  const sugerido = pedibles.length ? pedibles.reduce((a, b) => (b.nivel > a.nivel ? b : a)) : niveles[0];
+  return { peor, sugerido };
+}
+
+/** Nivel que se ofrece a quien escanea. */
+function nivelSugeridoPara(d, eq, alcance) {
+  const v = equipoConEstado(d, eq, d.porEstado, alcance);
+  return v.nivel_sugerido ?? 1;
+}
+
+const planParaCliente = (n) => ({
+  nivel: n.nivel, nombre: n.nombre, cada_dias: n.cada_dias, cada_horas: n.cada_horas,
+  responsable: n.responsable, hereda: n.hereda, cubre: n.cubre, aviso_dias: n.aviso_dias,
+  duracion_min: n.duracion_min,
+});
+
+const maxFecha = (lista) => lista.filter(Boolean).reduce((a, b) => (b > a ? b : a), '');
+
 // ============================================================ armado de vistas
 
-function equipoConEstado(d, eq, mapaEstado) {
+/**
+ * Vista de un equipo con su estado. `alcance` (oficial | externo | todos | empresa)
+ * limita el resumen a los niveles que le tocan a quien pregunta: el oficial no ve
+ * en rojo un mayor que hace una empresa.
+ */
+function equipoConEstado(d, eq, mapaEstado, alcance) {
   const est = mapaEstado.get(norm(eq.equipo_id).toUpperCase()) || {};
-  const periodicidad = periodicidadDe(d, eq);
-  const proximo = norm(est.proximo_venc);
-  const ultimo = norm(est.ultimo_preventivo);
+  const plan = planDe(d, eq);
+  const real = planEsReal(plan);
+  const empresa = empresaDe(d, eq);
+  const empresaClave = claveEmpresa(empresa);
+
+  const todos = estadosNiveles(d, eq, est, null, plan);
+  const propios = todos.filter((n) => nivelEnAlcance(n.responsable, empresaClave, alcance));
+  const mirados = propios.length ? propios : todos;
+  const { peor, sugerido } = resumenNiveles(mirados);
+  const proximo = peor.proximo_venc;
+  const ultimo = real ? maxFecha(todos.map((n) => n.ultimo)) : norm(est.ultimo_preventivo);
 
   const info = tipoInfo(d, eq.tipo || eq.tipo_id);
-  return {
+  const vista = {
     equipo_id: norm(eq.equipo_id),
     tipo: norm(eq.tipo || eq.tipo_id),
     funcion: info ? info.funcion : '',
@@ -1067,12 +1301,12 @@ function equipoConEstado(d, eq, mapaEstado) {
     piso_id: num(eq.piso_id),
     piso: norm(eq.piso),
     ubicacion_detalle: norm(eq.ubicacion_detalle),
-    responsable: norm(eq.responsable).toLowerCase() || 'oficial',
-    empresa: empresaDe(d, eq),
-    empresa_clave: claveEmpresa(empresaDe(d, eq)),
+    responsable: real ? sugerido.responsable : (norm(eq.responsable).toLowerCase() || 'oficial'),
+    empresa,
+    empresa_clave: empresaClave,
     equipo_padre: norm(eq.equipo_padre).toUpperCase(),
     criticidad: norm(eq.criticidad).toLowerCase() || 'normal',
-    periodicidad_dias: periodicidad,
+    periodicidad_dias: real ? sugerido.cada_dias : plan[0].cada_dias,
     estado_equipo: norm(eq.estado_equipo) || 'activo',
     marca: norm(eq.marca),
     capacidad: norm(eq.capacidad),
@@ -1084,11 +1318,17 @@ function equipoConEstado(d, eq, mapaEstado) {
     ultimo_preventivo: ultimo,
     ultimo_usuario: norm(est.ultimo_usuario),
     proximo_venc: proximo,
-    semaforo: semaforoDe(proximo, ultimo),
+    semaforo: peor.semaforo,
     dias_restantes: proximo ? diasEntre(HOY(), proximo) : null,
-    adelantable: proximo ? sePuedeAdelantar(proximo, periodicidad) : false,
+    adelantable: proximo ? sugerido.adelantable : false,
     ticket_estado: norm(est.ticket_estado),
   };
+  if (real) {
+    vista.niveles = todos;               // todos, con su responsable: el cliente decide qué mostrar
+    vista.nivel_sugerido = sugerido.nivel;
+    vista.nivel_pendiente = peor.nivel;
+  }
+  return vista;
 }
 
 function parseJson(txt) {
@@ -1112,7 +1352,7 @@ const claveEmpresa = (x) => norm(x).normalize('NFD').replace(/[\u0300-\u036f]/g,
  *   2. del proveedor que tenía el tipo en el catálogo (así funcionaba antes)
  */
 function empresaDe(d, e) {
-  if ((norm(e.responsable).toLowerCase() || 'oficial') !== 'externo') return '';
+  if ((norm(e.responsable).toLowerCase() || 'oficial') !== 'externo' && !tieneNivelExterno(d, e)) return '';
   const propia = norm(e.empresa);
   if (propia) return propia;
   const alta = norm(e.alta_usuario);
@@ -1133,9 +1373,10 @@ function empresaDe(d, e) {
 function filtrarPorResponsable(d, lista, responsable) {
   const r = claveEmpresa(responsable);
   if (!r || r === 'todos') return lista;
-  if (r === 'oficial') return lista.filter((e) => e.responsable === 'oficial');
-  if (r === 'externo') return lista.filter((e) => e.responsable === 'externo');
-  return lista.filter((e) => e.responsable === 'externo' && e.empresa_clave === r);
+  // con niveles, el equipo es de quien tiene AL MENOS UN nivel suyo
+  return lista.filter((e) => e.niveles
+    ? e.niveles.some((n) => nivelEnAlcance(n.responsable, e.empresa_clave, r))
+    : nivelEnAlcance(e.responsable, e.empresa_clave, r));
 }
 
 /**
@@ -1418,6 +1659,7 @@ function vistaCatalogo(d) {
       auditable: n.auditable,
       tolerancia: n.tolerancia,
       orden: n.orden,
+      nivel: n.nivel,
       activo: esSi(c.activo),
       cuando_avisa: textoRegla(c),
       regla: reglaParaEditor(textoRegla(c)),
@@ -1431,6 +1673,9 @@ function vistaCatalogo(d) {
     tipos,
     campos: filas.filter((c) => !c.alta),
     alta: filas.filter((c) => c.alta),
+    planes: [...d.porPlan].map(([tipo_id, niveles]) => ({ tipo_id, niveles: niveles.map(planParaCliente) })),
+    // sin la columna «nivel» el creador puede guardar el plan, pero no repartir preguntas
+    niveles_lista: d.tipos_campos.some((c) => 'nivel' in c),
     alta_lista: d.tipos_campos.some((c) => 'momento' in c) && hayColumnaDatos(d),
     // sin las dos columnas en la planilla el editor no ofrece auditar
     auditoria_lista: d.catalogo_tipos.some((t) => 'auditoria_activa' in t) &&
@@ -1766,6 +2011,13 @@ function montarAdmin(app, base, asinc) {
       fila.max = max ?? '';
     }
 
+    // en qué nivel de preventivo aparece: vacío = 1, «todos» o un número
+    if (!alta && p.nivel !== undefined) {
+      const t = norm(p.nivel).toLowerCase();
+      const n = num(t);
+      fila.nivel = t === 'todos' ? 'todos' : (n !== null && n >= 1 ? Math.floor(n) : '');
+    }
+
     if (existente) {
       fila.campo_id = norm(existente.campo_id);
     } else {
@@ -1800,6 +2052,86 @@ function montarAdmin(app, base, asinc) {
     // Cambiar un dato del alta no cambia el checklist: no sube su versión.
     await guardarCatalogo(d, alta ? sinVersion(tipoId) : subirVersiones(d, tipoId), [fila], p.autor);
     res.json(Object.assign({ ok: true, campo_id: fila.campo_id }, vistaCatalogo(d)));
+  }));
+
+  // --- plan de niveles de un tipo -----------------------------------------
+  // Reemplaza el plan completo: los niveles que ya no vienen quedan dados de baja
+  // (nada se borra: los preventivos hechos guardan a qué nivel pertenecían).
+  app.post(`${base}/admin/plan`, authAdmin, asinc(async (req, res) => {
+    const p = req.body || {};
+    const d = await datos(false);
+    const tipo = filaTipo(d, p.tipo_id);
+    if (!tipo) return mal(res, 404, 'No existe ese tipo');
+    const tipoId = norm(tipo.tipo_id);
+
+    const lista = Array.isArray(p.niveles) ? p.niveles : [];
+    if (lista.length > 6) return mal(res, 400, 'Un plan puede tener hasta 6 niveles');
+    const previos = new Map((d.porPlan.get(tipoId) || []).map((n) => [n.nivel, n]));
+    const hoy = HOY();
+    const filas = [];
+    const vistos = new Set();
+    let anterior = null;
+    for (const x of lista.slice().sort((a, b) => (num(a && a.nivel) ?? 0) - (num(b && b.nivel) ?? 0))) {
+      const nivel = num(x && x.nivel);
+      if (nivel === null || nivel < 1 || !Number.isInteger(nivel)) return mal(res, 400, 'Cada nivel necesita un número (1, 2, 3...)');
+      if (vistos.has(nivel)) return mal(res, 400, `El nivel ${nivel} está repetido`);
+      vistos.add(nivel);
+      const nombre = norm(x.nombre).replace(/[|;]/g, ' ').slice(0, 30);
+      if (!nombre) return mal(res, 400, `Falta el nombre del nivel ${nivel}`);
+      const cada = num(x.cada_dias);
+      if (cada === null || !Number.isInteger(cada) || cada < 1 || cada > 3650) {
+        return mal(res, 400, `El nivel ${nivel} necesita cada cuántos días vence (entre 1 y 3650)`);
+      }
+      if (anterior && cada <= anterior.cada_dias) {
+        return mal(res, 400, `El nivel ${nivel} tiene que ser más espaciado que «${anterior.nombre}» (${anterior.cada_dias} días)`);
+      }
+      const responsable = norm(x.responsable).toLowerCase();
+      if (!['oficial', 'externo'].includes(responsable)) return mal(res, 400, `El nivel ${nivel}: elegí quién lo hace`);
+      const aviso = num(x.aviso_dias) ?? DIAS_AMARILLO;
+      if (!Number.isInteger(aviso) || aviso < 0 || aviso >= cada) {
+        return mal(res, 400, `El nivel ${nivel}: el aviso tiene que ser menor que su período`);
+      }
+      const cubreTxt = Array.isArray(x.cubre) ? x.cubre.join(';') : x.cubre;
+      const nada = norm(cubreTxt).toLowerCase() === 'nada';
+      const cubre = nada ? null : listaNiveles(cubreTxt);
+      if (cubre && cubre.some((n) => n >= nivel)) return mal(res, 400, `El nivel ${nivel} solo puede cubrir niveles menores`);
+      const dur = num(x.duracion_min);
+      anterior = { nombre, cada_dias: cada };
+      filas.push({
+        tipo_id: tipoId,
+        nivel,
+        nombre_nivel: nombre,
+        cada_dias: cada,
+        cada_horas: '',
+        responsable,
+        hereda_checklist: x.hereda ? 'SI' : 'NO',
+        cubre: nada ? 'nada' : (cubre ? cubre.join(';') : ''),
+        aviso_dias: aviso,
+        duracion_min: dur !== null && dur > 0 ? Math.round(dur) : '',
+        // el reloj de un nivel nuevo arranca hoy; uno que ya existía conserva el suyo
+        desde: previos.has(nivel) ? (previos.get(nivel).desde || hoy) : hoy,
+        activo: 'SI',
+      });
+    }
+    // el nivel 1 es el que ya existía antes del plan: tiene que estar
+    if (filas.length && filas[0].nivel !== 1) return mal(res, 400, 'El plan tiene que empezar por el nivel 1');
+
+    const sello = { modificado: ahoraLocal(), modificado_por: norm(p.autor).slice(0, 60) || 'administrador' };
+    const rows = filas.map((f) => Object.assign({}, f, sello));
+    try {
+      await llamarSheets({ accion: 'guardar_planes', tipo_id: tipoId, niveles: rows, ...sello }, TIMEOUT_CATALOGO_MS);
+    } catch (e) {
+      if (/Acción desconocida/.test(e && e.message)) {
+        return mal(res, 503, 'El Apps Script todavía no tiene los niveles. Pegá Niveles.gs y creá una nueva versión de la implementación.');
+      }
+      if (/No existe la hoja/.test(e && e.message)) {
+        return mal(res, 503, 'Falta la hoja «planes». Ejecutá prepararNiveles una vez desde el Apps Script.');
+      }
+      throw e;
+    }
+    d.planes = (d.planes || []).filter((f) => norm(f.tipo_id) !== tipoId).concat(rows);
+    indexarPlanes(d);
+    res.json(Object.assign({ ok: true }, vistaCatalogo(d)));
   }));
 
   // --- retirar o volver a activar una pregunta ---------------------------
@@ -1913,10 +2245,11 @@ function montarPreventivo(app, opciones) {
       .filter((t) => esSi(t.activo) && norm(t.tipo_id))
       .map((t) => {
         const info = tipoInfo(d, t.tipo_id);
+        const plan = d.porPlan.get(info.tipo_id);
         return Object.assign({}, info, {
           campos: checklistDe(d, info.tipo_id),
           alta: altaDe(d, info.tipo_id),
-        });
+        }, plan ? { plan: plan.map(planParaCliente) } : {});
       });
     res.json({ ok: true, tipos });
   }));
@@ -1932,7 +2265,7 @@ function montarPreventivo(app, opciones) {
 
     let lista = d.equipos
       .filter((e) => num(e.institucion_id) === institucion)
-      .map((e) => equipoConEstado(d, e, mapaEstado))
+      .map((e) => equipoConEstado(d, e, mapaEstado, responsable))
       .filter((e) => e.estado_equipo !== 'fuera_servicio');
 
     lista = filtrarPorResponsable(d, lista, responsable);
@@ -1953,11 +2286,16 @@ function montarPreventivo(app, opciones) {
     const eq = d.porEquipo.get(id);
     if (!eq) return res.status(404).json({ ok: false, error: 'No existe', equipo_id: id });
 
-    const info = equipoConEstado(d, eq, d.porEstado);
+    const info = equipoConEstado(d, eq, d.porEstado, req.query.responsable);
+    const plan = planDe(d, eq);
+    const real = planEsReal(plan);
+    // con niveles, el checklist es el del nivel pedido (o el que corresponde ofrecer)
+    const nivel = real ? (num(req.query.nivel) ?? info.nivel_sugerido) : undefined;
     res.json({
       ok: true,
       equipo: info,
-      checklist: expandirPara(checklistDe(d, info.tipo), eq),
+      checklist: checklistParaNivel(d, eq, plan, nivel),
+      nivel,
       afecta_ambientes: terminalesBajo(d, eq.equipo_id).length,
     });
   }));
@@ -1976,13 +2314,21 @@ function montarPreventivo(app, opciones) {
     const info = tipoInfo(d, p.tipo);
     if (!info) return res.status(400).json({ ok: false, error: 'Tipo desconocido: ' + p.tipo });
 
-    const periodicidad = num(p.periodicidad_dias) || info.periodicidad_default || 90;
-    const responsable = ['oficial', 'externo'].includes(norm(p.responsable).toLowerCase())
-      ? norm(p.responsable).toLowerCase() : 'oficial';
+    // un tipo con plan de niveles manda: su primer nivel fija la periodicidad y quién
+    // lo mantiene sale de los niveles (todos de empresa → externo; si no, oficial)
+    const planAlta = d.porPlan.get(info.tipo_id);
+    const conNiveles = !!(planAlta && planAlta.length);
+    const hayExterno = conNiveles && planAlta.some((n) => n.responsable === 'externo');
+    const periodicidad = conNiveles ? planAlta[0].cada_dias
+      : (num(p.periodicidad_dias) || info.periodicidad_default || 90);
+    const responsable = conNiveles
+      ? (planAlta.every((n) => n.responsable === 'externo') ? 'externo' : 'oficial')
+      : (['oficial', 'externo'].includes(norm(p.responsable).toLowerCase())
+        ? norm(p.responsable).toLowerCase() : 'oficial');
     // Lo externo nace con su empresa: la que eligió el oficial que lo carga, o
     // la del técnico del proveedor (viene en su firma "Empresa · Persona").
     const firmaAlta = norm(p.usuario);
-    const empresa = responsable === 'externo'
+    const empresa = (responsable === 'externo' || hayExterno)
       ? (norm(p.empresa) || norm(p.proveedor) || (firmaAlta.includes(' · ') ? firmaAlta.split(' · ')[0] : '')).slice(0, 60)
       : '';
     if (responsable === 'externo' && !empresa) {
@@ -2055,10 +2401,30 @@ function montarPreventivo(app, opciones) {
       actualizado: ahoraLocal(),
     };
 
-    await llamarSheets({ accion: 'alta_equipo', equipo, estado });
-    aplicarLocal(d, { equipo, estado });
+    // cada nivel arranca con su primer vencimiento repartido (el primero, el mismo del estado)
+    let estadosNivelesAlta;
+    if (conNiveles) {
+      estadosNivelesAlta = planAlta.map((n, i) => {
+        const base = i === 0 ? primeraFecha : primerVencimiento(equipo, n.cada_dias, HOY());
+        return {
+          clave: claveNivel(id, n.nivel), equipo_id: id, nivel: n.nivel,
+          ultimo_fecha: '', ultimo_usuario: '', base_venc: base, proximo_venc: base,
+          actualizado: ahoraLocal(),
+        };
+      });
+      estado.nivel_pendiente = planAlta[0].nivel;
+    }
 
-    res.json({ ok: true, equipo_id: id, checklist: expandirPara(checklistDe(d, info.tipo_id), equipo) });
+    await llamarSheets({ accion: 'alta_equipo', equipo, estado, estados_niveles: estadosNivelesAlta });
+    aplicarLocal(d, { equipo, estado, estados_niveles: estadosNivelesAlta });
+
+    res.json({
+      ok: true,
+      equipo_id: id,
+      checklist: checklistParaNivel(d, equipo, planDe(d, equipo), conNiveles ? planAlta[0].nivel : undefined),
+      // un nivel de empresa sin empresa cargada nadie lo puede hacer: se avisa
+      falta_empresa: !!(hayExterno && !empresa),
+    });
   }));
 
   // --- corrección de ubicación / baja -----------------------------------
@@ -2126,7 +2492,25 @@ function montarPreventivo(app, opciones) {
     if (ajeno) return res.status(403).json({ ok: false, error: ajeno, ajeno: true });
 
     const info = tipoInfo(d, eq.tipo || eq.tipo_id);
-    const checklist = expandirPara(checklistDe(d, info ? info.tipo_id : eq.tipo), eq);
+
+    // Niveles: el celular dice cuál hizo; sin dato (cliente viejo) el servidor
+    // elige el que le tocaba ofrecer a esa persona.
+    const plan = planDe(d, eq);
+    const real = planEsReal(plan);
+    const esProveedor = norm(p.rol).toLowerCase() === 'proveedor';
+    let nivel = 1;
+    if (real) {
+      const pedido = num(p.nivel);
+      if (pedido !== null && !plan.some((x) => x.nivel === pedido)) {
+        return res.status(400).json({ ok: false, error: `Este equipo no tiene el nivel ${pedido} de preventivo.` });
+      }
+      nivel = pedido ?? nivelSugeridoPara(d, eq, esProveedor ? 'externo' : 'oficial');
+      if (esProveedor && plan.find((x) => x.nivel === nivel).responsable !== 'externo') {
+        return res.status(403).json({ ok: false, ajeno: true,
+          error: 'Ese nivel de preventivo lo hace el personal propio.' });
+      }
+    }
+    const checklist = checklistParaNivel(d, eq, plan, nivel);
 
     // el servidor recalcula: lo que dijo el cliente es solo para mostrar en pantalla
     const respuestas = completarCalculados(checklist, p.respuestas || {});
@@ -2168,7 +2552,7 @@ function montarPreventivo(app, opciones) {
 
     const fecha = norm(p.fecha) || ahoraLocal();
     const fechaDia = fecha.slice(0, 10);
-    const periodicidad = periodicidadDe(d, eq);
+    const periodicidad = real ? plan.find((x) => x.nivel === nivel).cada_dias : periodicidadDe(d, eq);
     const proximo = sumarDias(fechaDia, periodicidad);
 
     // El técnico puede decidir NO enviarlo: lo resolvió en el momento, ya está
@@ -2211,7 +2595,36 @@ function montarPreventivo(app, opciones) {
     };
 
     const estadoPrevio = d.porEstado.get(equipoId) || {};
-    const previo = norm(estadoPrevio.ultimo_preventivo);
+
+    // Con niveles: hacer uno deja cumplidos los menores. Cada nivel solo avanza si
+    // el registro es más nuevo que lo que ya tiene (la cola offline llega desordenada).
+    let filasNiveles = null;
+    let resumen = null;
+    let previo = norm(estadoPrevio.ultimo_preventivo);
+    if (real) {
+      const cubiertos = nivelesCubiertos(plan, nivel);
+      registro.nivel = nivel;
+      registro.niveles_cubiertos = cubiertos.join(';');
+      const antes = estadosNiveles(d, eq, estadoPrevio);
+      previo = maxFecha(antes.map((n) => n.ultimo));
+      const forzados = new Map();
+      filasNiveles = [];
+      for (const n of [nivel, ...cubiertos]) {
+        const a = antes.find((x) => x.nivel === n);
+        if (a.ultimo && fechaDia < a.ultimo) continue;
+        const previa = d.porNivel.get(claveNivel(equipoId, n));
+        const fila = {
+          clave: claveNivel(equipoId, n), equipo_id: equipoId, nivel: n,
+          ultimo_fecha: fechaDia, ultimo_usuario: norm(p.usuario),
+          base_venc: previa ? norm(previa.base_venc).slice(0, 10) : '',
+          proximo_venc: sumarDias(fechaDia, plan.find((x) => x.nivel === n).cada_dias),
+          actualizado: ahoraLocal(),
+        };
+        filasNiveles.push(fila);
+        forzados.set(n, fila);
+      }
+      resumen = resumenNiveles(estadosNiveles(d, eq, estadoPrevio, forzados));
+    }
 
     // Un registro que estuvo días en la cola offline puede llegar DESPUÉS de
     // otro más nuevo del mismo equipo. Si lo dejáramos escribir el estado,
@@ -2219,13 +2632,15 @@ function montarPreventivo(app, opciones) {
     // El histórico se guarda siempre; el estado solo lo pisa el más reciente.
     const esElMasNuevo = !previo || fechaDia >= previo;
 
-    const estado = esElMasNuevo ? {
+    let estado = esElMasNuevo ? {
       equipo_id: equipoId,
       equipo_referencia: referencia(eq),
       ultimo_preventivo: fechaDia,
       ultimo_usuario: norm(p.usuario),
-      proximo_venc: proximo,
-      semaforo: semaforoDe(proximo, fechaDia),
+      // el resumen del equipo lo marca su nivel más urgente, no el que se acaba de hacer
+      proximo_venc: resumen ? resumen.peor.proximo_venc : proximo,
+      semaforo: resumen ? resumen.peor.semaforo : semaforoDe(proximo, fechaDia),
+      ...(resumen ? { nivel_pendiente: resumen.peor.nivel } : {}),
       ultimo_resultado: desvios.length ? 'desvio' : 'conforme',
       desvios_json: desvios.length ? JSON.stringify(desvios) : norm(estadoPrevio.desvios_json),
       // Un desvío deja el ticket EN BANDEJA: nunca entra solo al circuito.
@@ -2237,9 +2652,21 @@ function montarPreventivo(app, opciones) {
       ticket_id: norm(estadoPrevio.ticket_id),
       actualizado: ahoraLocal(),
     } : null;
+    // un registro viejo no pisa el último resultado, pero sí puede cumplir niveles
+    if (!estado && resumen && filasNiveles.length) {
+      estado = Object.assign({}, estadoPrevio, {
+        proximo_venc: resumen.peor.proximo_venc,
+        semaforo: resumen.peor.semaforo,
+        nivel_pendiente: resumen.peor.nivel,
+        actualizado: ahoraLocal(),
+      });
+      delete estado._fila;
+    }
 
-    const r = await llamarSheets({ accion: 'registrar', registro, estado });
-    if (estado) aplicarLocal(d, { estado });
+    const r = await llamarSheets({
+      accion: 'registrar', registro, estado, estados_niveles: filasNiveles || undefined,
+    });
+    if (estado || filasNiveles) aplicarLocal(d, { estado, estados_niveles: filasNiveles || undefined });
 
     // El correctivo se anota en su propia hoja, con identificador propio. Sin
     // esto, la única huella era una celda de `estado` que el siguiente desvío
@@ -2291,6 +2718,11 @@ function montarPreventivo(app, opciones) {
       correctivo_id: correctivo ? correctivo.correctivo_id : null,
       correctivo_enviado: !!correctivo,
       proximo_venc: proximo,
+      ...(real ? {
+        nivel,
+        niveles_cubiertos: registro.niveles_cubiertos,
+        niveles: estadosNiveles(d, eq, d.porEstado.get(equipoId) || {}),
+      } : {}),
       respuestas,                       // incluye los calculados, para mostrarlos
     });
   }));
@@ -2327,7 +2759,7 @@ function montarPreventivo(app, opciones) {
     const responsable = req.query.responsable;
 
     let lista = d.equipos
-      .map((e) => equipoConEstado(d, e, mapaEstado))
+      .map((e) => equipoConEstado(d, e, mapaEstado, responsable))
       .filter((e) => e.estado_equipo !== 'fuera_servicio');
 
     if (institucion) lista = lista.filter((e) => e.institucion_id === institucion);
@@ -2568,7 +3000,7 @@ function montarPreventivo(app, opciones) {
     const limite = Math.min(50, num(req.query.limite) || 20);
     const d = await datos(false);
 
-    let lista = d.equipos.map((e) => equipoConEstado(d, e, d.porEstado));
+    let lista = d.equipos.map((e) => equipoConEstado(d, e, d.porEstado, req.query.responsable));
     if (req.query.responsable) lista = filtrarPorResponsable(d, lista, req.query.responsable);
 
     if (q) {
@@ -3332,5 +3764,7 @@ module.exports = {
     expandirPara, valorDe, terminalesBajo, raizDe, filtrarPorResponsable,
     reglaATexto, reglaParaEditor, slug, tiposQueUsan, cadenaDe, vistaCatalogo,
     empresaDe, claveEmpresa, ajenoParaProveedor, valoresDeEmpresa,
+    equipoConEstado, planDe, estadosNiveles, nivelesCubiertos, checklistNivel, normalizarPlan,
+    indexar,
   },
 };
