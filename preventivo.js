@@ -705,9 +705,37 @@ function validarDatos(campos, entrada, parcial) {
  * columna no existe, el Apps Script descartaría el dato en silencio y el técnico
  * creería que quedó guardado. Se frena antes, con un mensaje que dice qué falta.
  */
+
+/**
+ * Preguntas del alta cuya respuesta NO va a `datos_json` sino a su propia columna
+ * de `equipos`, porque otras partes del sistema las leen por ese nombre (las reglas
+ * «sobre_ref/bajo_ref», «repetir_por», la marca en las listas). El creador puede
+ * editarlas como cualquier otra pregunta del alta; acá solo se decide adónde va el dato.
+ */
+const ALTA_EN_COLUMNA = ['marca', 'capacidad', 'cant_compresores', 'ref_consumo_a', 'ref_capacitor_uf'];
+const esAltaEnColumna = (c) => ALTA_EN_COLUMNA.includes(c.campo_id);
+
+/** Parte las respuestas del alta en las que van a una columna y las que van a datos_json. */
+function partirDatos(datos) {
+  const columnas = {};
+  const resto = {};
+  for (const k of Object.keys(datos || {})) (ALTA_EN_COLUMNA.includes(k) ? columnas : resto)[k] = datos[k];
+  return { columnas, resto };
+}
+
 const hayColumnaDatos = (d) => d.equipos.some((e) => 'datos_json' in e);
 const ERROR_COLUMNA_DATOS = 'Falta la columna «datos_json» en la hoja equipos de la planilla. ' +
   'Agregala (fila de encabezados) y volvé a intentar.';
+
+/** Las respuestas del alta de un equipo: las de datos_json más las que viven en su columna. */
+function datosDeEquipo(d, eq) {
+  const datos = parseJson(eq.datos_json) || {};
+  const tipo = norm(eq.tipo || eq.tipo_id);
+  for (const c of tipo ? altaDe(d, tipo) : []) {
+    if (esAltaEnColumna(c) && norm(eq[c.campo_id]) !== '') datos[c.campo_id] = eq[c.campo_id];
+  }
+  return datos;
+}
 
 function tipoInfo(d, tipoId) {
   const clave = norm(tipoId);
@@ -1373,7 +1401,7 @@ function equipoConEstado(d, eq, mapaEstado, alcance) {
     estado_equipo: norm(eq.estado_equipo) || 'activo',
     marca: norm(eq.marca),
     capacidad: norm(eq.capacidad),
-    datos: parseJson(eq.datos_json) || {},   // respuestas a las preguntas del alta del tipo
+    datos: datosDeEquipo(d, eq),   // respuestas a las preguntas del alta del tipo
     motivo_baja: norm(eq.motivo_baja),
     ref_consumo_a: norm(eq.ref_consumo_a),   // valor único o lista "18;18;14"
     ref_capacitor_uf: norm(eq.ref_capacitor_uf),
@@ -2211,6 +2239,55 @@ function montarAdmin(app, base, asinc) {
     res.json(Object.assign({ ok: true }, vistaCatalogo(d)));
   }));
 
+  // --- datos del alta de siempre, como preguntas editables ------------------
+  // Marca y capacidad se piden en todos los tipos; cantidad de compresores, consumo
+  // de chapa y capacitor solo si el checklist del tipo los usa en alguna regla.
+  // Agrega lo que falte y no toca lo que ya existe.
+  app.post(`${base}/admin/alta-estandar`, authAdmin, asinc(async (req, res) => {
+    const p = req.body || {};
+    const d = await datos(false);
+    const tipo = filaTipo(d, p.tipo_id);
+    if (!tipo) return mal(res, 404, 'No existe ese tipo');
+    const tipoId = norm(tipo.tipo_id);
+    if (!d.tipos_campos.some((c) => 'momento' in c) || !hayColumnaDatos(d)) {
+      return mal(res, 503, 'La planilla todavía no tiene las columnas del alta (momento y datos_json).');
+    }
+    const check = checklistDe(d, tipoId);
+    const usaRef = (ref) => check.some((c) => c.dispara && c.dispara.ref === ref);
+    const pedidas = [
+      { id: 'marca', etiqueta: 'Marca', tipo_campo: 'texto', requerido: 'NO', ayuda: '' },
+      { id: 'capacidad', etiqueta: 'Capacidad', tipo_campo: 'texto', requerido: 'NO', ayuda: '' },
+    ];
+    if (check.some((c) => c.repetir_por === 'cant_compresores')) {
+      pedidas.push({ id: 'cant_compresores', etiqueta: '¿Cuántos compresores tiene?', tipo_campo: 'numero', requerido: 'SI', min: 1, max: 12,
+        ayuda: 'Con varios compresores, el consumo de chapa se carga como lista: 18;18;14' });
+    }
+    if (usaRef('ref_consumo_a')) {
+      pedidas.push({ id: 'ref_consumo_a', etiqueta: 'Consumo nominal del compresor (chapa)', tipo_campo: 'texto', unidad: 'A', requerido: 'SI',
+        ayuda: 'Se carga una sola vez. Después solo se mide el consumo real y la app compara.' });
+    }
+    if (usaRef('ref_capacitor_uf')) {
+      pedidas.push({ id: 'ref_capacitor_uf', etiqueta: 'Capacidad nominal del capacitor', tipo_campo: 'numero', unidad: 'µF', requerido: 'SI',
+        ayuda: 'Está impresa en el propio capacitor. Se carga una sola vez.' });
+    }
+    const existentes = new Set(d.tipos_campos.filter((c) => norm(c.tipo_id) === tipoId).map((c) => norm(c.campo_id)));
+    const propias = d.tipos_campos.filter((c) => norm(c.tipo_id) === tipoId && esSi(c.activo) && esAlta(c));
+    let orden = propias.length ? Math.max(...propias.map((c) => num(c.orden) ?? 0)) : 0;
+    const filas = [];
+    for (const q of pedidas) {
+      if (existentes.has(q.id)) continue;          // ya está (o fue retirada): no se pisa
+      orden += 10;
+      filas.push({
+        tipo_id: tipoId, campo_id: q.id, etiqueta: q.etiqueta, tipo_campo: q.tipo_campo,
+        opciones: '', unidad: q.unidad || '', cuando_avisa: '', autocompletable: 'NO', ayuda: q.ayuda,
+        requerido: q.requerido, min: q.min ?? '', max: q.max ?? '', orden, activo: 'SI', formula: '',
+        repetir_por: '', momento: 'alta',
+      });
+    }
+    if (filas.length) await guardarCatalogo(d, sinVersion(tipoId), filas, p.autor);
+    res.json(Object.assign({ ok: true, agregadas: filas.map((f) => f.campo_id) }, vistaCatalogo(d)));
+  }));
+
   // --- retirar o volver a activar una pregunta ---------------------------
   // Nada se borra: los preventivos viejos guardan respuestas de esa pregunta.
   app.post(`${base}/admin/campo/activo`, authAdmin, asinc(async (req, res) => {
@@ -2416,8 +2493,10 @@ function montarPreventivo(app, opciones) {
     // contra la configuración, no contra lo que el celular dice que preguntó.
     const camposAlta = altaDe(d, info.tipo_id);
     let datosJson = '';
+    let enColumna = {};
+    const camposEnJson = camposAlta.filter((c) => !esAltaEnColumna(c));
     if (camposAlta.length) {
-      if (!hayColumnaDatos(d)) return res.status(503).json({ ok: false, error: ERROR_COLUMNA_DATOS });
+      if (camposEnJson.length && !hayColumnaDatos(d)) return res.status(503).json({ ok: false, error: ERROR_COLUMNA_DATOS });
       const v = validarDatos(camposAlta, p.datos, false);
       if (v.faltan.length || v.errores.length) {
         return res.status(400).json({
@@ -2426,7 +2505,9 @@ function montarPreventivo(app, opciones) {
           faltan: v.faltan,
         });
       }
-      datosJson = JSON.stringify(v.datos);
+      const partes = partirDatos(v.datos);
+      enColumna = partes.columnas;
+      datosJson = JSON.stringify(partes.resto);
     }
 
     const equipo = {
@@ -2436,20 +2517,20 @@ function montarPreventivo(app, opciones) {
       lugar: norm(p.lugar),
       piso: norm(p.piso),
       ubicacion_detalle: norm(p.ubicacion_detalle),
-      marca: norm(p.marca),
-      capacidad: norm(p.capacidad),
+      marca: norm(enColumna.marca ?? p.marca),
+      capacidad: norm(enColumna.capacidad ?? p.capacidad),
       // Blindaje: aquí solo entra la política (oficial | externo). La empresa
       // concreta va en su propia columna.
       responsable,
       empresa,
       equipo_padre: norm(p.equipo_padre).toUpperCase(),
       criticidad: norm(p.criticidad).toLowerCase() || 'normal',
-      cant_compresores: num(p.cant_compresores) ?? '',
+      cant_compresores: num(enColumna.cant_compresores ?? p.cant_compresores) ?? '',
       periodicidad_dias: periodicidad,
       estado_equipo: 'activo',
       motivo_baja: '',
-      ref_consumo_a: norm(p.ref_consumo_a),
-      ref_capacitor_uf: norm(p.ref_capacitor_uf),
+      ref_consumo_a: norm(enColumna.ref_consumo_a ?? p.ref_consumo_a),
+      ref_capacitor_uf: norm(enColumna.ref_capacitor_uf ?? p.ref_capacitor_uf),
       umbrales_json: p.umbrales ? JSON.stringify(p.umbrales) : '',
       alta_fecha: HOY(),
       alta_usuario: norm(p.usuario),
@@ -2460,7 +2541,7 @@ function montarPreventivo(app, opciones) {
     };
     // solo viaja si el tipo tiene preguntas de alta: así un tipo sin ellas escribe
     // exactamente lo mismo que antes, exista o no la columna
-    if (camposAlta.length) equipo.datos_json = datosJson;
+    if (camposEnJson.length) equipo.datos_json = datosJson;
 
     // el alta reparte el primer vencimiento; el preventivo que venga después lo pisa
     const primeraFecha = primerVencimiento(equipo, periodicidad, HOY());
@@ -3149,6 +3230,14 @@ function montarPreventivo(app, opciones) {
     // Los datos del alta (tipo de matafuego, etc.) se corrigen en el momento, como
     // la marca o la capacidad: cada dato que cambia deja su renglón en `cambios`.
     if (campos.datos && typeof campos.datos === 'object') {
+      // las que viven en su propia columna se corrigen como cualquier otro campo del equipo
+      const partes = partirDatos(campos.datos);
+      for (const k of Object.keys(partes.columnas)) {
+        if (campos[k] === undefined) campos[k] = partes.columnas[k];
+      }
+      campos.datos = partes.resto;
+    }
+    if (campos.datos && typeof campos.datos === 'object' && Object.keys(campos.datos).length) {
       const info = tipoInfo(d, eq.tipo || eq.tipo_id);
       const v = validarDatos(info ? altaDe(d, info.tipo_id) : [], campos.datos, true);
       if (v.faltan.length || v.errores.length) {
