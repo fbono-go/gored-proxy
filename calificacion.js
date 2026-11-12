@@ -77,26 +77,43 @@ function vencidos(equipos, fechas, hoy, ventanaDias, graciaDias) {
  * Cerrado dentro de la meta = a tiempo. Abierto con más edad que la meta = tarde.
  * Abierto todavía dentro de la meta no cuenta: no se sabe cómo termina.
  */
-function tickets(lista, hoy, ventanaDias, metaDias) {
+/** Prioridades de Zammad (id → clave). */
+const PRIORIDADES = { 5: 'vital', 2: 'alta', 6: 'media', 7: 'baja' };
+
+/**
+ * Cada ticket tiene su plazo según su prioridad. `metas` puede ser un número (el
+ * mismo plazo para todos) o { def, vital, alta, media, baja } en días; un ticket
+ * sin prioridad conocida usa `def`. Cerrado dentro del plazo = a tiempo; cerrado
+ * después = tarde; abierto que ya pasó su plazo = tarde (vencido); abierto que
+ * todavía está en plazo no cuenta.
+ */
+function tickets(lista, hoy, ventanaDias, metas) {
+  const m = typeof metas === 'number' ? { def: metas } : (metas || {});
   const desde = sumar(hoy, -ventanaDias);
   let aTiempo = 0, tarde = 0, abiertos = 0, suma = 0, cerrados = 0;
+  const porPrioridad = {};
 
   for (const t of lista) {
     if (!t.creado || dia(t.creado) < desde) continue;
+    const clavePrio = PRIORIDADES[t.prioridad] || 'sin';
+    const meta = m[clavePrio] ?? m.def;
+    const fila = porPrioridad[clavePrio] || (porPrioridad[clavePrio] = { meta, a_tiempo: 0, tarde: 0, abiertos: 0 });
     if (t.cerrado) {
       const d = diasEntre(t.creado, t.cerrado);
       if (d === null) continue;
       cerrados++;
       suma += d;
-      if (d <= metaDias) aTiempo++; else tarde++;
+      if (d <= meta) { aTiempo++; fila.a_tiempo++; } else { tarde++; fila.tarde++; }
     } else {
       abiertos++;
-      if (diasEntre(t.creado, hoy) > metaDias) tarde++;
+      fila.abiertos++;
+      if (diasEntre(t.creado, hoy) > meta) { tarde++; fila.tarde++; }
     }
   }
   return {
     eventos: aTiempo + tarde, a_tiempo: aTiempo, tarde, abiertos,
     promedio_dias: cerrados ? Math.round(suma / cerrados * 10) / 10 : null,
+    por_prioridad: porPrioridad,
   };
 }
 

@@ -1466,7 +1466,7 @@ async function ticketsDeProveedores(desdeIso) {
     proveedores: Object.values(PROVEEDORES),
     tickets: tickets.map((t) => ({
       id: t.id, numero: t.number, owner: PROVEEDORES[t.owner_id] || '',
-      creado: t.created_at, cerrado: t.close_at || null,
+      creado: t.created_at, cerrado: t.close_at || null, prioridad: t.priority_id,
     })),
   };
 }

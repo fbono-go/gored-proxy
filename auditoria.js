@@ -60,18 +60,21 @@ const DEF = {
   peso_auditorias: 50,     // cuánto pesa cada parte en la nota final
   peso_tickets: 25,
   peso_vencidos: 25,
-  ticket_meta_dias: 7,     // un ticket cerrado dentro de este plazo cuenta como a tiempo
+  ticket_meta_dias: 7,     // plazo de un ticket sin prioridad conocida
+  ticket_meta_vital_dias: 1, ticket_meta_alta_dias: 3, ticket_meta_media_dias: 7, ticket_meta_baja_dias: 14,
   vence_gracia_dias: 0,    // días de tolerancia antes de contar un preventivo como tarde
 };
 // Cómo se califica a un proveedor: es general, no depende de la institución.
 const CALIFICACION = ['ventana_dias', 'min_calificacion', 'peso_observacion_pct', 'penal_falso', 'nivel_verde', 'nivel_amarillo',
-  'peso_auditorias', 'peso_tickets', 'peso_vencidos', 'ticket_meta_dias', 'vence_gracia_dias'];
+  'peso_auditorias', 'peso_tickets', 'peso_vencidos', 'ticket_meta_dias',
+  'ticket_meta_vital_dias', 'ticket_meta_alta_dias', 'ticket_meta_media_dias', 'ticket_meta_baja_dias', 'vence_gracia_dias'];
 const LIMITES = {
   tope_semanal: [1, 100], plazo_dias: [1, 60], pct_azar: [0, 100], tolerancia_pct: [1, 50],
   ventana_dias: [7, 365], min_calificacion: [1, 50], peso_observacion_pct: [0, 100],
   penal_falso: [0, 50], nivel_verde: [1, 100], nivel_amarillo: [0, 99],
   peso_auditorias: [0, 100], peso_tickets: [0, 100], peso_vencidos: [0, 100],
   ticket_meta_dias: [1, 90], vence_gracia_dias: [0, 60],
+  ticket_meta_vital_dias: [0.5, 90], ticket_meta_alta_dias: [0.5, 90], ticket_meta_media_dias: [0.5, 90], ticket_meta_baja_dias: [0.5, 90],
 };
 const ETIQUETA_CONFIG = {
   tope_semanal: 'Tope por semana', plazo_dias: 'Plazo del oficial',
@@ -80,7 +83,8 @@ const ETIQUETA_CONFIG = {
   peso_observacion_pct: 'Valor de una observación', penal_falso: 'Resta por falso conforme',
   nivel_verde: 'Nota para estar en verde', nivel_amarillo: 'Nota para estar en amarillo',
   peso_auditorias: 'Peso de las auditorías', peso_tickets: 'Peso de los tickets', peso_vencidos: 'Peso de los vencidos',
-  ticket_meta_dias: 'Meta de resolución de tickets', vence_gracia_dias: 'Gracia para los vencidos',
+  ticket_meta_dias: 'Plazo de un ticket sin prioridad', ticket_meta_vital_dias: 'Plazo Vital', ticket_meta_alta_dias: 'Plazo Alta',
+  ticket_meta_media_dias: 'Plazo Media', ticket_meta_baja_dias: 'Plazo Baja', vence_gracia_dias: 'Gracia para los vencidos',
 };
 const TIPOS_AUDITABLES = ['si_no', 'opciones', 'numero'];
 const ABIERTAS = ['en_cola', 'pendiente'];
@@ -444,7 +448,9 @@ function crear(c) {
       let tic = { nota: null, eventos: 0, a_tiempo: 0, tarde: 0, abiertos: 0, promedio_dias: null, sin_datos: !ext.tickets };
       if (ext.tickets) {
         const suyos = ext.tickets.filter((x) => Cal.mismoProveedor(x.owner, g.proveedor));
-        const r = Cal.tickets(suyos, hoy, cfg.ventana_dias, cfg.ticket_meta_dias);
+        const r = Cal.tickets(suyos, hoy, cfg.ventana_dias, {
+          def: cfg.ticket_meta_dias, vital: cfg.ticket_meta_vital_dias, alta: cfg.ticket_meta_alta_dias,
+          media: cfg.ticket_meta_media_dias, baja: cfg.ticket_meta_baja_dias });
         tic = Object.assign(r, { nota: Cal.porcentaje(r.a_tiempo, r.eventos, cfg.min_calificacion) });
       }
 
@@ -725,8 +731,9 @@ function crear(c) {
         if (inst && (p[k] === '' || p[k] === null)) { filas.push({ clave: k + sufijo, valor: '' }); continue; }
         const v = num(p[k]);
         const [lo, hi] = LIMITES[k];
-        if (v === null || !Number.isInteger(v) || v < lo || v > hi) {
-          return mal(res, 400, `${ETIQUETA_CONFIG[k]}: un número entero de ${lo} a ${hi}`);
+        const decimal = k.startsWith('ticket_meta_') && k !== 'ticket_meta_dias';
+        if (v === null || (!decimal && !Number.isInteger(v)) || v < lo || v > hi) {
+          return mal(res, 400, `${ETIQUETA_CONFIG[k]}: un número ${decimal ? '' : 'entero '}de ${lo} a ${hi}`);
         }
         filas.push({ clave: k + sufijo, valor: v });
       }
