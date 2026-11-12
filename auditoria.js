@@ -43,6 +43,8 @@
 
 'use strict';
 
+const Cal = require('./calificacion');
+
 const DEF = {
   tope_semanal: 10,        // auditorías que se liberan por semana
   plazo_dias: 7,           // días que tiene el oficial para hacerla
@@ -51,17 +53,36 @@ const DEF = {
   ventana_dias: 90,        // período que cuenta para la calificación
   min_calificacion: 3,     // auditorías mínimas para calificar
   caduca_cola_dias: 45,    // una candidata más vieja que esto ya no sirve
+  peso_observacion_pct: 50, // cuánto vale una observación frente a un conforme
+  penal_falso: 0,          // puntos que resta cada falso conforme
+  nivel_verde: 85,         // desde esta nota el proveedor está bien
+  nivel_amarillo: 60,      // desde esta, en observación; por debajo, rojo
+  peso_auditorias: 50,     // cuánto pesa cada parte en la nota final
+  peso_tickets: 25,
+  peso_vencidos: 25,
+  ticket_meta_dias: 7,     // un ticket cerrado dentro de este plazo cuenta como a tiempo
+  vence_gracia_dias: 0,    // días de tolerancia antes de contar un preventivo como tarde
 };
+// Cómo se califica a un proveedor: es general, no depende de la institución.
+const CALIFICACION = ['ventana_dias', 'min_calificacion', 'peso_observacion_pct', 'penal_falso', 'nivel_verde', 'nivel_amarillo',
+  'peso_auditorias', 'peso_tickets', 'peso_vencidos', 'ticket_meta_dias', 'vence_gracia_dias'];
 const LIMITES = {
   tope_semanal: [1, 100], plazo_dias: [1, 60], pct_azar: [0, 100], tolerancia_pct: [1, 50],
+  ventana_dias: [7, 365], min_calificacion: [1, 50], peso_observacion_pct: [0, 100],
+  penal_falso: [0, 50], nivel_verde: [1, 100], nivel_amarillo: [0, 99],
+  peso_auditorias: [0, 100], peso_tickets: [0, 100], peso_vencidos: [0, 100],
+  ticket_meta_dias: [1, 90], vence_gracia_dias: [0, 60],
 };
 const ETIQUETA_CONFIG = {
   tope_semanal: 'Tope por semana', plazo_dias: 'Plazo del oficial',
   pct_azar: 'Porcentaje al azar', tolerancia_pct: 'Tolerancia general',
+  ventana_dias: 'Período que cuenta', min_calificacion: 'Auditorías mínimas',
+  peso_observacion_pct: 'Valor de una observación', penal_falso: 'Resta por falso conforme',
+  nivel_verde: 'Nota para estar en verde', nivel_amarillo: 'Nota para estar en amarillo',
+  peso_auditorias: 'Peso de las auditorías', peso_tickets: 'Peso de los tickets', peso_vencidos: 'Peso de los vencidos',
+  ticket_meta_dias: 'Meta de resolución de tickets', vence_gracia_dias: 'Gracia para los vencidos',
 };
 const TIPOS_AUDITABLES = ['si_no', 'opciones', 'numero'];
-const NIVEL_VERDE = 85;
-const NIVEL_AMARILLO = 60;
 const ABIERTAS = ['en_cola', 'pendiente'];
 
 function crear(c) {
@@ -295,24 +316,41 @@ function crear(c) {
 
   // ============================================================ calificación
 
-  function calificar(d, cfg) {
+  /**
+   * Una fila por proveedor con lo que sale de las auditorías. Aparecen todos los
+   * que mantienen equipos y los que tienen auditoría activa, tengan o no datos.
+   * Cada grupo trae sus equipos para calcular después los preventivos vencidos.
+   */
+  function grupos(d, cfg) {
     const hoy = c.HOY();
-    const grupos = new Map();
+    const mapa = new Map();
     const grupo = (nombre) => {
       const k = norm(nombre).toLowerCase();
-      if (!grupos.has(k)) {
-        grupos.set(k, { proveedor: k, realizadas: 0, conformes: 0, observaciones: 0, no_conformes: 0,
-          falsos_conformes: 0, pendientes: 0, vencidas: 0, en_cola: 0 });
+      if (!mapa.has(k)) {
+        mapa.set(k, { proveedor: k, equipos: 0, _eq: [], realizadas: 0, conformes: 0, observaciones: 0,
+          no_conformes: 0, falsos_conformes: 0, pendientes: 0, vencidas: 0, en_cola: 0 });
       }
-      return grupos.get(k);
+      return mapa.get(k);
     };
 
-    // los que tienen auditoría activa aparecen aunque todavía no tengan datos
+    for (const e of (d.equipos || [])) {
+      if (norm(e.estado_equipo) === 'fuera_servicio') continue;
+      const emp = c.empresaDe ? c.empresaDe(d, e) : norm(e.empresa);
+      if (!emp) continue;
+      const g = grupo(emp);
+      g.equipos++;
+      const est = d.porEstado && d.porEstado.get(norm(e.equipo_id).toUpperCase());
+      g._eq.push({
+        equipo_id: norm(e.equipo_id).toUpperCase(),
+        periodicidad: c.periodicidadDe ? c.periodicidadDe(d, e) : (num(e.periodicidad_dias) || 90),
+        proximo_venc: est ? norm(est.proximo_venc) : '',
+      });
+    }
     for (const t of d.catalogo_tipos) {
       if (esSi(t.auditoria_activa) && norm(t.proveedor_actual)) grupo(t.proveedor_actual);
     }
 
-    for (const a of d.auditorias) {
+    for (const a of (d.auditorias || [])) {
       if (!norm(a.proveedor)) continue;
       const estado = norm(a.estado);
       const g = grupo(a.proveedor);
@@ -331,15 +369,106 @@ function crear(c) {
         g.falsos_conformes += num(a.n_falsos) || 0;
       }
     }
+    return mapa;
+  }
 
-    return [...grupos.values()].map((g) => {
-      const califica = g.realizadas >= cfg.min_calificacion;
-      const nota = califica ? Math.round(100 * (g.conformes + 0.5 * g.observaciones) / g.realizadas) : null;
-      return Object.assign(g, {
-        calificacion: nota,
-        nivel: nota === null ? 'sin_datos' : nota >= NIVEL_VERDE ? 'verde' : nota >= NIVEL_AMARILLO ? 'amarillo' : 'rojo',
-      });
-    }).sort((a, b) => (a.calificacion ?? 101) - (b.calificacion ?? 101) || a.proveedor.localeCompare(b.proveedor));
+  // Lo que viene de afuera (historial de preventivos en la planilla y tickets en
+  // Zammad) se pide una vez cada tanto: no cambia entre un clic y otro del panel.
+  const VIDA_EXTERNOS_MS = 10 * 60 * 1000;
+  let externos = { clave: '', hasta: 0, valor: null };
+
+  async function cargarExternos(cfg) {
+    const hoy = c.HOY();
+    const clave = `${hoy}|${cfg.ventana_dias}`;
+    if (externos.clave === clave && Date.now() < externos.hasta) return externos.valor;
+
+    const desde = c.sumarDias(hoy, -cfg.ventana_dias);
+    // un preventivo que se hizo dentro del período tiene su anterior fuera de él
+    const desdeFechas = c.sumarDias(hoy, -(cfg.ventana_dias + 400));
+    const valor = { fechas: null, tickets: null, proveedoresZammad: [], avisos: [] };
+
+    const [f, t] = await Promise.allSettled([
+      c.llamarSheets({ accion: 'preventivos_fechas', desde: desdeFechas }),
+      c.ticketsDeProveedores ? c.ticketsDeProveedores(desde) : Promise.reject(new Error('sin acceso a Zammad')),
+    ]);
+    if (f.status === 'fulfilled' && Array.isArray(f.value.registros)) {
+      valor.fechas = new Map();
+      for (const r of f.value.registros) {
+        const id = norm(r.equipo_id).toUpperCase();
+        if (!valor.fechas.has(id)) valor.fechas.set(id, []);
+        valor.fechas.get(id).push(norm(r.fecha).slice(0, 10));
+      }
+    } else {
+      valor.avisos.push('No se pudo leer el historial de preventivos' +
+        (f.status === 'rejected' ? ' (' + f.reason.message + ')' : ' (falta actualizar el Apps Script)') + ': los vencidos no entran en la nota.');
+    }
+    if (t.status === 'fulfilled') {
+      valor.tickets = t.value.tickets;
+      valor.proveedoresZammad = t.value.proveedores;
+    } else {
+      valor.avisos.push('No se pudieron leer los tickets de Zammad (' + t.reason.message + '): no entran en la nota.');
+    }
+    // un fallo no se recuerda tanto como un acierto
+    externos = { clave, hasta: Date.now() + (valor.avisos.length ? 60 * 1000 : VIDA_EXTERNOS_MS), valor };
+    return valor;
+  }
+
+  /** Nota de cada proveedor: auditorías, tickets y preventivos vencidos, con sus pesos. */
+  async function calificarTodo(d, cfg) {
+    const mapa = grupos(d, cfg);
+    const ext = await cargarExternos(cfg);
+    const hoy = c.HOY();
+
+    // los proveedores de Zammad también figuran, aunque no tengan equipos ni auditorías
+    for (const nombre of ext.proveedoresZammad) {
+      const ya = [...mapa.keys()].some((k) => Cal.mismoProveedor(k, nombre));
+      if (!ya) mapa.set(norm(nombre).toLowerCase(), { proveedor: norm(nombre).toLowerCase(), equipos: 0, _eq: [],
+        realizadas: 0, conformes: 0, observaciones: 0, no_conformes: 0, falsos_conformes: 0, pendientes: 0, vencidas: 0, en_cola: 0 });
+    }
+
+    const lista = [...mapa.values()].map((g) => {
+      const aud = { nota: Cal.notaAuditorias(g, cfg), realizadas: g.realizadas };
+
+      let ven = { nota: null, eventos: 0, tarde: 0, a_tiempo: 0, vencidos_hoy: 0, sin_datos: !ext.fechas };
+      if (ext.fechas && g._eq.length) {
+        const r = Cal.vencidos(g._eq, ext.fechas, hoy, cfg.ventana_dias, cfg.vence_gracia_dias);
+        ven = Object.assign(r, { nota: Cal.porcentaje(r.a_tiempo, r.eventos, cfg.min_calificacion) });
+      }
+
+      let tic = { nota: null, eventos: 0, a_tiempo: 0, tarde: 0, abiertos: 0, promedio_dias: null, sin_datos: !ext.tickets };
+      if (ext.tickets) {
+        const suyos = ext.tickets.filter((x) => Cal.mismoProveedor(x.owner, g.proveedor));
+        const r = Cal.tickets(suyos, hoy, cfg.ventana_dias, cfg.ticket_meta_dias);
+        tic = Object.assign(r, { nota: Cal.porcentaje(r.a_tiempo, r.eventos, cfg.min_calificacion) });
+      }
+
+      const { nota, nivel } = Cal.combinar({ auditorias: aud.nota, tickets: tic.nota, vencidos: ven.nota }, cfg);
+      const { _eq, ...resto } = g;
+      return Object.assign(resto, { calificacion: nota, nivel, componentes: { auditorias: aud, tickets: tic, vencidos: ven } });
+    });
+
+    lista.sort((a, b) => (a.calificacion ?? 101) - (b.calificacion ?? 101) || a.proveedor.localeCompare(b.proveedor));
+    return { proveedores: lista, avisos: ext.avisos };
+  }
+
+  /** Total histórico y las últimas 8 semanas (por fecha de la auditoría), para ver el ritmo. */
+  function hechasPorSemana(realizadas, semanaActual) {
+    const semanas = [];
+    for (let i = 0; i < 8; i++) {
+      semanas.push({ desde: c.sumarDias(semanaActual, -7 * i), hechas: 0, conformes: 0, observaciones: 0, no_conformes: 0 });
+    }
+    const por = new Map(semanas.map((x) => [x.desde, x]));
+    const total = { hechas: 0, conformes: 0, observaciones: 0, no_conformes: 0 };
+    for (const a of realizadas) {
+      const r = norm(a.resultado);
+      const k = r === 'conforme' ? 'conformes' : r === 'observacion' ? 'observaciones' : r === 'no_conforme' ? 'no_conformes' : '';
+      total.hechas++;
+      if (k) total[k]++;
+      const dia = norm(a.fecha_auditoria).slice(0, 10);
+      const x = dia && por.get(lunesDe(dia));
+      if (x) { x.hechas++; if (k) x[k]++; }
+    }
+    return { total, semanas };
   }
 
   // ============================================================ vistas
@@ -516,12 +645,38 @@ function crear(c) {
         },
         en_cola: suyas.filter((a) => norm(a.estado) === 'en_cola').length,
         pendientes: suyas.filter((a) => norm(a.estado) === 'pendiente').length,
-        proveedores: calificar({ auditorias: suyas, catalogo_tipos: d.catalogo_tipos }, cfg),
+        activas: suyas.filter((a) => ABIERTAS.includes(norm(a.estado))).map((a) => ({
+          auditoria_id: norm(a.auditoria_id),
+          equipo_id: norm(a.equipo_id),
+          equipo_referencia: norm(a.equipo_referencia),
+          proveedor: norm(a.proveedor),
+          estado: norm(a.estado),
+          motivo: norm(a.motivo),
+          fecha_preventivo: norm(a.fecha_preventivo).slice(0, 10),
+          fecha_liberada: norm(a.fecha_liberada).slice(0, 10),
+          vence: norm(a.vence),
+          dias: norm(a.vence) ? c.diasEntre(hoy, norm(a.vence)) : null,
+          prioridad: num(a.prioridad),
+        })).sort((a, b) => (a.estado === b.estado ? 0 : a.estado === 'pendiente' ? -1 : 1) ||
+          (a.vence || '9').localeCompare(b.vence || '9') || (a.prioridad - b.prioridad) ||
+          a.fecha_preventivo.localeCompare(b.fecha_preventivo)).slice(0, 200),
+        hechas: hechasPorSemana(realizadas, semana),
         // lo que no salió conforme y nadie miró todavía
         para_revisar: realizadas.filter((a) => norm(a.resultado) !== 'conforme' && !norm(a.revision_estado))
           .slice(0, 50).map(completa),
         recientes: realizadas.slice(0, 40).map(completa),
       });
+    }));
+
+    // --- calificación de todos los proveedores ----------------------------
+    app.get(`${base}/auditoria/calificacion`, auth, asinc(async (req, res) => {
+      const d = await c.datos(false);
+      if (!habilitada(d)) return res.json({ ok: true, habilitada: false });
+      const cfg = config(d);
+      const criterio = {};
+      for (const k of CALIFICACION) criterio[k] = cfg[k];
+      const r = await calificarTodo(d, cfg);
+      res.json({ ok: true, habilitada: true, criterio, proveedores: r.proveedores, avisos: r.avisos });
     }));
 
     // --- el referente revisa una observación ------------------------------
@@ -554,6 +709,9 @@ function crear(c) {
       if (p.institucion !== undefined && p.institucion !== '' && p.institucion !== null && (inst === null || inst < 1)) {
         return mal(res, 400, 'Institución inválida');
       }
+      if (inst && CALIFICACION.some((k) => k in p)) {
+        return mal(res, 400, 'La forma de calificar es la misma para todas las instituciones');
+      }
       const sufijo = inst ? `@${inst}` : '';
       const filas = [];
       for (const k of Object.keys(LIMITES)) {
@@ -567,6 +725,18 @@ function crear(c) {
         filas.push({ clave: k + sufijo, valor: v });
       }
       if (!filas.length) return mal(res, 400, 'No hay nada para guardar');
+
+      // el verde tiene que estar por encima del amarillo, con lo que ya había y lo que llega
+      if (CALIFICACION.some((k) => k in p)) {
+        const nuevo = config(d);
+        for (const f of filas) nuevo[f.clave] = f.valor;
+        if (nuevo.nivel_amarillo >= nuevo.nivel_verde) {
+          return mal(res, 400, 'La nota para el verde tiene que ser mayor que la del amarillo');
+        }
+        if (nuevo.peso_auditorias + nuevo.peso_tickets + nuevo.peso_vencidos <= 0) {
+          return mal(res, 400, 'Al menos una de las tres partes tiene que pesar más que cero');
+        }
+      }
 
       await c.llamarSheets({ accion: 'config_guardar', filas });
       for (const f of filas) {
@@ -632,7 +802,7 @@ function crear(c) {
     }));
   }
 
-  return { montarRutas, alRegistrar, _interno: { comparar, calificar, candidata, config, lunesDe, auditables } };
+  return { montarRutas, alRegistrar, _interno: { comparar, grupos, calificarTodo, candidata, config, lunesDe, auditables } };
 }
 
 module.exports = { crear };

@@ -59,6 +59,7 @@ const FALLBACK_SECTORES = {
 // Arrancan con el fallback para que el proxy nunca quede sin datos.
 let OWNERS   = { ...FALLBACK_OWNERS };
 let SECTORES = { ...FALLBACK_SECTORES };
+let PROVEEDORES = {};   // id de Zammad → nombre, solo los usuarios de tipo Proveedor (para calificarlos)
 
 // Convierte la estructura de data.json en los mapas OWNERS y SECTORES que usa el proxy.
 function aplicarData(data) {
@@ -69,6 +70,9 @@ function aplicarData(data) {
   (data.referentes_historicos || []).forEach(r => { owners[r.id] = r.nombre; });
   // Oficiales + proveedores
   (data.usuarios_derivables || []).forEach(u => { owners[u.id] = u.nombre; });
+  const provs = {};
+  (data.usuarios_derivables || []).forEach(u => { if (u.tipo === 'Proveedor') provs[u.id] = u.nombre; });
+  if (Object.keys(provs).length) PROVEEDORES = provs;
 
   const sectores = {};
   (data.sectores || []).forEach(s => {
@@ -1447,7 +1451,26 @@ app.post('/api/recargar-data', async (req, res) => {
 // Módulo aparte (preventivo.js) para que lo nuevo no pueda romper lo que ya
 // funciona. Requiere PREV_SHEETS_URL y PREV_TOKEN en las variables de Render.
 const { montarPreventivo } = require('./preventivo');
-montarPreventivo(app);
+
+/**
+ * Tickets de Zammad asignados a usuarios de tipo Proveedor, creados desde `desdeIso`
+ * (YYYY-MM-DD). Los usa la calificación de proveedores del preventivo: tiempo de
+ * resolución de cada uno. Una sola búsqueda, paginada por searchAll.
+ */
+async function ticketsDeProveedores(desdeIso) {
+  const ids = Object.keys(PROVEEDORES);
+  if (!ids.length) return { proveedores: [], tickets: [] };
+  const consulta = `created_at:>${desdeIso} AND (${ids.map((i) => 'owner_id:' + i).join(' OR ')})`;
+  const { tickets } = await searchAll(consulta);
+  return {
+    proveedores: Object.values(PROVEEDORES),
+    tickets: tickets.map((t) => ({
+      id: t.id, numero: t.number, owner: PROVEEDORES[t.owner_id] || '',
+      creado: t.created_at, cerrado: t.close_at || null,
+    })),
+  };
+}
+montarPreventivo(app, { ticketsDeProveedores });
 
 // ── Tickets programados ─────────────────────────────────────────────────
 // Módulo aparte (programados.js). Los tickets automáticos se crean en el portal

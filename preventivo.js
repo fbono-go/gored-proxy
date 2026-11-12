@@ -2370,6 +2370,7 @@ function montarPreventivo(app, opciones) {
     uuidV4, referencia, checklistDe, expandirPara, valorDe, evaluarDisparos, filaTipo, filaCampo,
     equipoConEstado, terminalesBajo, vistaCatalogo, guardarCatalogo, sinVersion, authAdmin,
     actual: () => cache.datos,
+    empresaDe, periodicidadDe, ticketsDeProveedores: opts.ticketsDeProveedores,
   });
 
   // --- diagnóstico -------------------------------------------------------
