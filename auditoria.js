@@ -298,6 +298,12 @@ function crear(c) {
         ok = comoSiNo(a) === comoSiNo(b);
       } else {
         ok = String(a) === String(b);
+        // En una pregunta de opciones con regla de aviso, dos respuestas distintas
+        // pero del mismo lado (ninguna avisa, o las dos avisan) no son una diferencia:
+        // el proveedor no puede declarar "limpio" ni el oficial constatar "lavado hoy".
+        if (!ok && f.tipo_campo === 'opciones' && f.dispara && !f.dispara._invalido) {
+          ok = (c.evaluarDisparos([f], declarado, eq).length > 0) === (c.evaluarDisparos([f], auditado, eq).length > 0);
+        }
       }
       items.push({
         campo: f.campo_id, etiqueta: f.etiqueta, indice: f.indice || 0, unidad: f.unidad,
