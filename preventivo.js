@@ -1857,6 +1857,39 @@ function montarAdmin(app, base, asinc) {
     });
   }));
 
+  // --- quién mantiene este tipo de equipo en este lugar -------------------
+  // Para el alta: en un lugar puede haber equipos del mismo tipo de dos empresas.
+  // No hay tabla que mantener: se mira a los equipos que ya están cargados ahí.
+  // `unica` = todos los vecinos son de la misma empresa (o del personal propio),
+  // y entonces `sugerida` es esa ('' = personal propio). Con dos o más, o sin
+  // vecinos, `sugerida` es null y quien da el alta elige.
+  app.get(`${base}/empresa-sugerida`, asinc(async (req, res) => {
+    const d = await datos(false);
+    const lugar = num(req.query.lugar);
+    const tipo = norm(req.query.tipo);
+    if (lugar === null || !tipo) return mal(res, 400, 'Falta el lugar o el tipo');
+    const porClave = new Map();
+    let propios = 0;
+    for (const e of d.equipos) {
+      if (norm(e.estado_equipo) === 'fuera_servicio') continue;
+      if (num(e.lugar_id) !== lugar || norm(e.tipo || e.tipo_id) !== tipo) continue;
+      const nombre = empresaDe(d, e);
+      if (!nombre) { propios++; continue; }
+      const clave = claveEmpresa(nombre);
+      if (!porClave.has(clave)) porClave.set(clave, { clave, nombre, equipos: 0 });
+      porClave.get(clave).equipos++;
+    }
+    const empresas = [...porClave.values()].sort((a, b) => b.equipos - a.equipos);
+    const fuentes = empresas.length + (propios ? 1 : 0);
+    res.json({
+      ok: true,
+      empresas,
+      personal_propio: propios,
+      unica: fuentes === 1,
+      sugerida: fuentes === 1 ? (empresas.length ? empresas[0].nombre : '') : null,
+    });
+  }));
+
   // --- cambiar la empresa de varios equipos a la vez -------------------
   // Cuando cambia un contrato. Queda una fila en `cambios` por equipo, ya
   // aprobada, con quién lo hizo: el historial de cada equipo lo muestra.
