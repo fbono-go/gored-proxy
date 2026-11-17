@@ -510,6 +510,7 @@ function armarChecklist(d, tipoId, vistos, alta) {
  *    "si es dañado"                    una opción concreta
  *    "si es dañado o roto"             cualquiera de varias
  *    "supera 25% de ref_consumo_a"     comparado con un dato del equipo
+ *    "llega a 80% de dato_corriente_nominal"   el 80% de una respuesta del alta
  */
 function parsearRegla(texto) {
   const t = norm(texto);
@@ -541,6 +542,9 @@ function parsearRegla(texto) {
     return { op: 'sobre_ref', ref: m[2], pct: Number(m[1]) };
   if ((m = limpio.match(/^cae\s+(?:mas\s+de\s+)?(-?[\d.]+)\s*%\s+de\s+([a-z0-9_]+)/)))
     return { op: 'bajo_ref', ref: m[2], pct: Number(m[1]) };
+  // «llega a 80% de dato_corriente_nominal»: el X% de la referencia, no X% por encima
+  if ((m = limpio.match(/^llega\s+a\s+(-?[\d.]+)\s*%\s+de\s+([a-z0-9_]+)/)))
+    return { op: 'llega_ref', ref: m[2], pct: Number(m[1]) };
 
   if (/^si es\s+/.test(limpio)) {
     // Los valores se extraen del texto ORIGINAL: quitarles los acentos los
@@ -709,7 +713,7 @@ function validarDatos(campos, entrada, parcial) {
 /**
  * Preguntas del alta cuya respuesta NO va a `datos_json` sino a su propia columna
  * de `equipos`, porque otras partes del sistema las leen por ese nombre (las reglas
- * «sobre_ref/bajo_ref», «repetir_por», la marca en las listas). El creador puede
+ * «sobre_ref/bajo_ref/llega_ref», «repetir_por», la marca en las listas). El creador puede
  * editarlas como cualquier otra pregunta del alta; acá solo se decide adónde va el dato.
  */
 const ALTA_EN_COLUMNA = ['marca', 'capacidad', 'cant_compresores', 'ref_consumo_a', 'ref_capacitor_uf'];
@@ -853,9 +857,15 @@ function completarCalculados(checklist, respuestas) {
  * Un campo sin regla nunca dispara, por más mal que esté: queda como registro.
  */
 /** Lee una referencia del equipo, que puede ser un valor o una lista "12;14". */
+const PREF_DATO = 'dato_';
+
 function refPorIndice(equipo, columna, indice) {
   if (!equipo) return null;
-  const crudo = equipo[columna];
+  // «dato_<pregunta>»: la respuesta que se dio a una pregunta del alta. Según de
+  // dónde venga el equipo, las respuestas están ya leídas (datos) o en la celda.
+  const crudo = columna.startsWith(PREF_DATO)
+    ? ((equipo.datos || parseJson(equipo.datos_json) || {})[columna.slice(PREF_DATO.length)])
+    : equipo[columna];
   const txt = norm(crudo);
   if (txt.indexOf(';') === -1) return crudo;
   const partes = txt.split(';').map((x) => x.trim());
@@ -917,6 +927,19 @@ function evaluarDisparos(checklist, respuestas, equipo) {
           disparo = vB < piso;
           detalle = `${vB}${campo.unidad} está ${Math.round((1 - vB / refB) * 100)}% ` +
                     `por debajo del nominal de ${refB}${campo.unidad}`;
+        }
+        break;
+      }
+
+      case 'llega_ref': {
+        // El X% de una referencia (ej. 80% de la corriente nominal de un tablero)
+        const refL = num(refPorIndice(equipo, norm(regla.ref), campo.indice));
+        const vL = num(valor);
+        const pctL = num(regla.pct) ?? 0;
+        if (refL !== null && refL > 0 && vL !== null) {
+          disparo = vL >= refL * pctL / 100;
+          detalle = `${vL}${campo.unidad} es el ${Math.round(vL / refL * 100)}% ` +
+                    `de la referencia de ${refL}${campo.unidad}`;
         }
         break;
       }
@@ -999,6 +1022,12 @@ function rangoOptimo(campo, equipo) {
     case 'menor': return { texto: fmt(num(r.valor)) + u + ' o más' };
     case 'mayor': return { texto: 'hasta ' + fmt(num(r.valor)) + u };
     case 'fuera': return { texto: fmt(num(r.min)) + ' a ' + fmt(num(r.max)) + u };
+    case 'llega_ref': {
+      const ref = num(refPorIndice(equipo, norm(r.ref), campo.indice));
+      const pct = num(r.pct) ?? 0;
+      if (ref === null || ref <= 0) return { texto: 'sin referencia cargada en el equipo', sinReferencia: true };
+      return { texto: 'menos de ' + fmt(ref * pct / 100) + u + ` (${fmt(pct)}% de ${fmt(ref)}${u})` };
+    }
     case 'sobre_ref': {
       const ref = num(refPorIndice(equipo, norm(r.ref), campo.indice));
       const pct = num(r.pct) ?? 0;
@@ -1627,7 +1656,7 @@ const equiposDe = (d, tipos) =>
  * Devuelve { texto } o { error }. El resultado se vuelve a leer con
  * parsearRegla: si el motor no lo entendería exactamente así, no se guarda.
  */
-function reglaATexto(regla, campo) {
+function reglaATexto(regla, campo, refsAlta) {
   const r = regla || {};
   const op = norm(r.op) || 'nunca';
   const tc = campo.tipo_campo;
@@ -1651,12 +1680,14 @@ function reglaATexto(regla, campo) {
     if (a >= b) return { error: 'El mínimo tiene que ser menor que el máximo' };
     texto = `fuera de ${a} a ${b}`;
     esperado = { op, min: a, max: b };
-  } else if ((op === 'sobre_ref' || op === 'bajo_ref') && numerico) {
+  } else if ((op === 'sobre_ref' || op === 'bajo_ref' || op === 'llega_ref') && numerico) {
     const ref = norm(r.ref);
     const pct = num(r.pct);
-    if (!REFS_EQUIPO[ref]) return { error: 'Elegí contra qué dato del equipo se compara' };
+    if (!REFS_EQUIPO[ref] && !(refsAlta && refsAlta.has(ref))) {
+      return { error: 'Elegí contra qué dato del equipo se compara' };
+    }
     if (pct === null || pct <= 0 || pct > 500) return { error: 'El porcentaje va de 1 a 500' };
-    texto = `${op === 'sobre_ref' ? 'supera' : 'cae'} ${pct}% de ${ref}`;
+    texto = `${op === 'sobre_ref' ? 'supera' : op === 'llega_ref' ? 'llega a' : 'cae'} ${pct}% de ${ref}`;
     esperado = { op, ref, pct };
   } else if (op === 'opciones' && tc === 'opciones') {
     const validos = new Set(campo.opciones.map((o) => o.v));
@@ -1698,6 +1729,7 @@ function reglaParaEditor(texto) {
     case 'mayor': return { op: r.op, a: r.valor };
     case 'fuera': return { op: 'fuera', a: r.min, b: r.max };
     case 'sobre_ref':
+    case 'llega_ref':
     case 'bajo_ref': return { op: r.op, ref: r.ref, pct: r.pct };
     default: return { op: 'otra', texto: norm(texto) };
   }
@@ -2108,7 +2140,11 @@ function montarAdmin(app, base, asinc) {
       pedida = marcadas.length ? { op: 'opciones', valores: marcadas } : { op: 'nunca' };
     }
     // un dato del alta nunca avisa: no hay nada que medir
-    const regla = alta ? { texto: '' } : reglaATexto(pedida, { tipo_campo: tipoCampo, opciones });
+    // Las preguntas numéricas del alta se pueden usar como referencia («supera 80% de dato_<pregunta>»)
+    const refsAlta = new Set(altaDe(d, tipoId)
+      .filter((c) => c.tipo_campo === 'numero')
+      .map((c) => PREF_DATO + c.campo_id));
+    const regla = alta ? { texto: '' } : reglaATexto(pedida, { tipo_campo: tipoCampo, opciones }, refsAlta);
     if (regla.error) return mal(res, 400, regla.error);
 
     const numerico = tipoCampo === 'numero' || tipoCampo === 'calculado';
