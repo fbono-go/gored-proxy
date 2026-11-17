@@ -661,6 +661,14 @@ function valorDe(respuestas, campo) {
  * respuesta vacía en una no obligatoria significa "borrar el dato".
  * Devuelve { datos, faltan, errores }.
  */
+// Fotos del alta: se guardan las direcciones de las fotos ya subidas (/foto), no la imagen
+const FOTOS_ALTA_MAX = 3;
+const URL_FOTO_MAX = 500;
+const fotosValidas = (v) => (Array.isArray(v) ? v : [v])
+  .map((x) => (typeof x === 'string' ? x.trim() : ''))
+  .filter((x) => /^https?:\/\//i.test(x) && x.length <= URL_FOTO_MAX)
+  .slice(0, FOTOS_ALTA_MAX);
+
 function validarDatos(campos, entrada, parcial) {
   const datos = {};
   const faltan = [];
@@ -673,6 +681,10 @@ function validarDatos(campos, entrada, parcial) {
 
     let v = crudo[c.campo_id];
     if (typeof v === 'string') v = v.trim();
+    if (c.tipo_campo === 'foto' && v !== undefined && v !== null && v !== '') {
+      v = fotosValidas(v);
+      if (!v.length) v = '';
+    }
     if (v === undefined || v === null || v === '') {
       if (c.requerido) faltan.push(c.etiqueta);
       else if (parcial) datos[c.campo_id] = '';
@@ -697,6 +709,8 @@ function validarDatos(campos, entrada, parcial) {
         continue;
       }
       datos[c.campo_id] = String(v);
+    } else if (c.tipo_campo === 'foto') {
+      datos[c.campo_id] = v;
     } else {
       datos[c.campo_id] = String(v).slice(0, 120);
     }
@@ -1545,8 +1559,8 @@ const FUNCION_POR_BLOQUE = {
 };
 // `calculado` no se crea desde el editor: solo se conserva el que ya existe.
 const TIPOS_RESPUESTA = ['si_no', 'opciones', 'numero', 'texto', 'foto'];
-// Las preguntas del alta no llevan foto ni regla de aviso: son datos del equipo.
-const TIPOS_RESPUESTA_ALTA = ['si_no', 'opciones', 'numero', 'texto'];
+// Las preguntas del alta no llevan regla de aviso: son datos del equipo (una foto guarda sus direcciones).
+const TIPOS_RESPUESTA_ALTA = ['si_no', 'opciones', 'numero', 'texto', 'foto'];
 // Campo común a todos los checklists (bloque base_general): la pantalla lo dibuja
 // como el recuadro de observaciones, no como una pregunta más.
 const CAMPO_OBSERVACIONES = 'observaciones';
@@ -2105,7 +2119,9 @@ function montarAdmin(app, base, asinc) {
           'no se puede cambiar. Retirala y creá una nueva.');
       }
     }
-    if (tipoCampo !== 'calculado' && !(alta ? TIPOS_RESPUESTA_ALTA : TIPOS_RESPUESTA).includes(tipoCampo)) {
+    // un calculado solo se conserva (tiene fórmula); desde acá no se crea uno nuevo
+    const conservaCalculado = tipoCampo === 'calculado' && existente && norm(existente.tipo_campo) === 'calculado';
+    if (!conservaCalculado && !(alta ? TIPOS_RESPUESTA_ALTA : TIPOS_RESPUESTA).includes(tipoCampo)) {
       return mal(res, 400, 'Tipo de respuesta desconocido');
     }
 
@@ -3318,7 +3334,8 @@ function montarPreventivo(app, opciones) {
         });
       }
       const actuales = parseJson(eq.datos_json) || {};
-      const cambiados = Object.keys(v.datos).filter((k) => String(actuales[k] ?? '') !== String(v.datos[k]));
+      const comoTexto = (x) => (Array.isArray(x) ? x.join(' ') : String(x ?? ''));
+      const cambiados = Object.keys(v.datos).filter((k) => comoTexto(actuales[k]) !== comoTexto(v.datos[k]));
       if (cambiados.length) {
         if (!hayColumnaDatos(d)) return res.status(503).json({ ok: false, error: ERROR_COLUMNA_DATOS });
         for (const k of cambiados) {
@@ -3328,8 +3345,8 @@ function montarPreventivo(app, opciones) {
             equipo_id: equipoId,
             equipo_referencia: referencia(eq),
             campo: 'dato_' + k,
-            valor_anterior: String(actuales[k] ?? ''),
-            valor_nuevo: String(v.datos[k]),
+            valor_anterior: comoTexto(actuales[k]),
+            valor_nuevo: comoTexto(v.datos[k]),
             motivo: norm(p.motivo),
             solicitado_por: quien,
             rol: norm(p.rol),
