@@ -3417,7 +3417,7 @@ function montarPreventivo(app, opciones) {
   }));
 
   /** Solicitudes de cambio, para la bandeja del referente. */
-  app.get(`${base}/cambios`, auth, asinc(async (req, res) => {
+  app.get(`${base}/cambios`, auth, exigirAlcance, asinc(async (req, res) => {
     const d = await datos(false);
     const estado = norm(req.query.estado).toLowerCase() || 'pendiente';
     const instituciones = institucionesPedidas(req.query);
@@ -3820,7 +3820,7 @@ function montarPreventivo(app, opciones) {
   }));
 
   // --- bandeja de revisión de correctivos --------------------------------
-  app.get(`${base}/bandeja`, auth, asinc(async (req, res) => {
+  app.get(`${base}/bandeja`, auth, exigirAlcance, asinc(async (req, res) => {
     const d = await datos(false);
     const instituciones = institucionesPedidas(req.query);
 
@@ -3989,6 +3989,17 @@ function institucionesPedidas(q) {
   const ids = new Set();
   for (const x of crudo.split(',')) { const n = num(x); if (n !== null && n !== undefined && n !== '') ids.add(n); }
   return ids;
+}
+
+/**
+ * Para /bandeja y /cambios no alcanza con omitir el filtro para ver todo: así
+ * pedían las copias viejas de la app, y mezclaban los sectores. Quien de verdad
+ * quiere todas las instituciones lo dice con `?todas=1`.
+ */
+function exigirAlcance(req, res, next) {
+  if (institucionesPedidas(req.query) || req.query.todas === '1') return next();
+  res.status(409).json({ ok: false,
+    error: 'Esta copia de la app quedó vieja. Cerrala y volvé a abrirla, o usá Config → Actualizar app.' });
 }
 
 /** "Personal propio" o vacío → equipo oficial; cualquier otro nombre → externo de esa empresa. */
