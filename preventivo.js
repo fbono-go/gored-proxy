@@ -3923,6 +3923,12 @@ function montarPreventivo(app, opciones) {
 
   montarAdmin(app, base, asinc);
   auditoria.montarRutas(app, base, auth, asinc);
+  // Visor de proveedores: solo lectura, con su propia clave por empresa
+  require('./visor').montar(app, base, asinc, {
+    norm, num, claveEmpresa, datos, llamarSheets, ahoraLocal, parseJson, tipoInfo, empresaDe,
+    equipoConEstado, filtrarPorResponsable, planDe, planEsReal, checklistDe, checklistNivel,
+    expandirPara, detallePreventivo, authAdmin,
+  });
 
   console.log(`[preventivo] montado en ${base}`);
   return app;
