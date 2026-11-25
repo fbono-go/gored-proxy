@@ -2538,6 +2538,10 @@ function montarPreventivo(app, opciones) {
     const info = tipoInfo(d, p.tipo);
     if (!info) return res.status(400).json({ ok: false, error: 'Tipo desconocido: ' + p.tipo });
 
+    // frena también a las apps que todavía no se actualizaron
+    const cruzada = etiquetaAjena(id, p.institucion_id, p.institucion);
+    if (cruzada) return res.status(400).json({ ok: false, error: cruzada });
+
     // un tipo con plan de niveles manda: su primer nivel fija la periodicidad y quién
     // lo mantiene sale de los niveles (todos de empresa → externo; si no, oficial)
     const planAlta = d.porPlan.get(info.tipo_id);
@@ -2676,6 +2680,11 @@ function montarPreventivo(app, opciones) {
       if (p[k] !== undefined) equipo[k] = p[k];
     }
     if (p.umbrales !== undefined) equipo.umbrales_json = JSON.stringify(p.umbrales);
+
+    if (p.institucion_id !== undefined) {
+      const cruzada = etiquetaAjena(id, p.institucion_id, p.institucion);
+      if (cruzada) return res.status(400).json({ ok: false, error: cruzada });
+    }
 
     // cambiar la periodicidad recalcula el vencimiento sobre el último preventivo hecho
     let estado = null;
@@ -3976,6 +3985,19 @@ const CAMPOS_DIRECTOS = new Set([
   'ref_consumo_a', 'ref_capacitor_uf', 'cant_compresores', 'notas',
 ]);
 const EMPRESA_PROPIA = 'Personal propio';
+
+// Código con el que arranca la etiqueta de cada institución (misma regla que los
+// generadores de etiquetas). Una institución nueva usa las iniciales del nombre.
+const CODIGOS_INST = { 13: 'ICR', 12: 'SP', 15: 'SDN', 14: 'DMO', 33: 'GO', 132: 'ME', 138: 'GG' };
+
+/** Mensaje de error si la etiqueta no es de esa institución; '' si está bien. */
+function etiquetaAjena(equipoId, instId, instNombre) {
+  const esperado = CODIGOS_INST[num(instId)] || norm(instNombre).split(/\s+/).map((p) => p[0] || '')
+    .join('').toUpperCase().replace(/[^A-Z]/g, '').slice(0, 4);
+  const cod = equipoId.split('-')[0];
+  return cod === esperado ? '' :
+    `La etiqueta ${equipoId} es «${cod}» y no corresponde a ${norm(instNombre) || 'esa institución'}`;
+}
 
 /**
  * Instituciones pedidas: `?instituciones=13,14,33` (varias) o `?institucion=13`.
