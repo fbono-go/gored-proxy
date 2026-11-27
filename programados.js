@@ -6,17 +6,21 @@
  * que ya funciona. Se monta en server.js con:
  *
  *     const { montarProgramados } = require('./programados');
- *     montarProgramados(app, { crearTicket: crearTicketProgramado });
+ *     montarProgramados(app, { crearTicket: crearTicketProgramado, verificarPortal });
  *
  * Variables de entorno en Render:
  *   PROG_SHEETS_URL      URL /exec del Apps Script "Programados.gs"
  *   PROG_TOKEN           mismo valor que la propiedad TOKEN del Apps Script
  *   CRON_SECRET          secreto del trabajo en cron-job.org (header x-cron-secret)
  *   ADMIN_CLAVE          ya existe (la del panel preventivo): protege crear/ver/borrar
- *   PROG_PORTAL_EMAIL    usuario del portal con el que se crean los tickets
- *   PROG_PORTAL_PASS     su contraseña (se lee en server.js, nunca se guarda en la hoja)
+ *   PROG_CRYPT_KEY       texto largo y secreto con el que se cifran las contraseñas
+ *   PROG_PORTAL_EMAIL    solo para programaciones viejas, sin autor guardado
+ *   PROG_PORTAL_PASS     su contraseña (se lee en server.js)
  *
  * Diseño:
+ *  - Cada ticket sale con el usuario del portal de QUIEN LO PROGRAMÓ. La app manda
+ *    email y contraseña al guardar; se prueban contra el portal y se guardan en
+ *    ticket._autor, con la contraseña cifrada (AES-256-GCM). Nunca vuelve a la app.
  *  - El disparador es EXTERNO (cron-job.org -> GET /api/programados/ejecutar):
  *    Render free duerme y un setInterval interno no es confiable.
  *  - Cada llamada evalúa todas las programaciones activas y ejecuta las vencidas.
@@ -176,6 +180,51 @@ function validarProg(b) {
   return { ok: true, prog: { nombre, frecuencia: b.frecuencia, hora, diasSemana, diaMes, ticket } };
 }
 
+// ============================================================ credenciales del autor
+
+/** Clave AES derivada de PROG_CRYPT_KEY. Cerrado por defecto: sin variable no se guarda nada. */
+function claveCifrado() {
+  const secreto = String(process.env.PROG_CRYPT_KEY || '').trim();
+  if (secreto.length < 16) {
+    throw new Error('Falta configurar PROG_CRYPT_KEY en Render (16 caracteres o más)');
+  }
+  return crypto.createHash('sha256').update(secreto).digest();
+}
+
+/** El email va como dato autenticado: la contraseña cifrada no sirve pegada a otro usuario. */
+function cifrarAutor(email, password) {
+  const iv = crypto.randomBytes(12);
+  const c = crypto.createCipheriv('aes-256-gcm', claveCifrado(), iv);
+  c.setAAD(Buffer.from(email));
+  const datos = Buffer.concat([c.update(password, 'utf8'), c.final()]);
+  return { email, clave: [iv, c.getAuthTag(), datos].map((b) => b.toString('base64')).join('.') };
+}
+
+function descifrarAutor(autor) {
+  const key = claveCifrado();
+  try {
+    const [iv, tag, datos] = String(autor.clave).split('.').map((x) => Buffer.from(x, 'base64'));
+    const d = crypto.createDecipheriv('aes-256-gcm', key, iv, { authTagLength: 16 });
+    d.setAAD(Buffer.from(autor.email));
+    d.setAuthTag(tag);
+    return { email: autor.email, password: Buffer.concat([d.update(datos), d.final()]).toString('utf8') };
+  } catch {
+    throw new Error(`No se pudo leer la contraseña de ${autor.email}: borrá la programación y creala de nuevo.`);
+  }
+}
+
+/** Separa el autor de los datos del ticket. Lo que sale de acá es seguro para la app. */
+function sinSecreto(prog) {
+  const { _autor, ...ticket } = prog.ticket || {};
+  return { ...prog, ticket, autor: (_autor && _autor.email) || '' };
+}
+
+/** Crea el ticket con las credenciales del autor (o null en programaciones viejas). */
+async function crearDe(prog, crearTicket) {
+  const { _autor, ...datos } = prog.ticket || {};
+  await crearTicket(datos, _autor ? descifrarAutor(_autor) : null);
+}
+
 // ============================================================ seguridad
 
 const MAX_FALLOS = 10;
@@ -298,7 +347,7 @@ async function ejecutarVencidas({ store, crearTicket }, ahora = ahoraAR()) {
       try {
         if (!(await store.marcar(prog.id, clave))) continue; // otra instancia ya la tomó
         reservada = true;
-        await crearTicket(prog.ticket);
+        await crearDe(prog, crearTicket);
         creados.push(prog.id);
       } catch (e) {
         const error = String((e && e.message) || e);
@@ -315,7 +364,7 @@ async function ejecutarVencidas({ store, crearTicket }, ahora = ahoraAR()) {
 // ============================================================ rutas
 
 function montarProgramados(app, opciones) {
-  const { crearTicket } = opciones;
+  const { crearTicket, verificarPortal } = opciones;
   const store = opciones.store || storeSheets;
   const base = opciones.base || '/api/programados';
   const router = express.Router();
@@ -327,7 +376,7 @@ function montarProgramados(app, opciones) {
     });
   };
   const idValido = (id) => /^[A-Za-z0-9_-]{1,40}$/.test(id);
-  const conProxima = (p) => ({ ...p, proxima: p.activo ? proximaEjecucion(p, ahoraAR()) : null });
+  const paraApp = (p) => ({ ...sinSecreto(p), proxima: p.activo ? proximaEjecucion(p, ahoraAR()) : null });
 
   // Disparador: lo llama cron-job.org cada 15 minutos.
   router.get('/ejecutar', authCron, asinc(async (req, res) => {
@@ -341,7 +390,7 @@ function montarProgramados(app, opciones) {
 
   router.get('/', asinc(async (req, res) => {
     const items = await store.listar();
-    res.json({ ok: true, items: items.map(conProxima) });
+    res.json({ ok: true, items: items.map(paraApp) });
   }));
 
   router.post('/', asinc(async (req, res) => {
@@ -350,10 +399,23 @@ function montarProgramados(app, opciones) {
     if ((await store.listar()).length >= MAX_PROGRAMACIONES) {
       return res.status(400).json({ ok: false, error: `Máximo ${MAX_PROGRAMACIONES} programaciones.` });
     }
+    const email = str(req.body.email).toLowerCase();
+    const password = String(req.body.password || '');
+    if (!email || !password) {
+      return res.status(400).json({ ok: false, error: 'Faltan tu email y contraseña del portal. Actualizá la app y revisá Config.' });
+    }
+    claveCifrado(); // si falta la variable, avisar antes de molestar al portal
+    try {
+      await verificarPortal(email, password);
+    } catch (e) {
+      // 400 y no 401: la app usa 401 para "clave de administración incorrecta"
+      return res.status(400).json({ ok: false, error: String((e && e.message) || e) });
+    }
+    v.prog.ticket._autor = cifrarAutor(email, password);
     // Si la hora de hoy ya pasó, la primera salida es la próxima, no ahora mismo.
     const prog = { ...v.prog, activo: true, ultimaClave: '' };
     prog.ultimaClave = claveSiVence(prog, ahoraAR()) || '';
-    res.json({ ok: true, item: conProxima(await store.guardar(prog)) });
+    res.json({ ok: true, item: paraApp(await store.guardar(prog)) });
   }));
 
   router.post('/:id/activo', asinc(async (req, res) => {
@@ -378,7 +440,7 @@ function montarProgramados(app, opciones) {
     const prog = (await store.listar()).find((p) => p.id === id);
     if (!prog) return res.status(404).json({ ok: false, error: 'No existe' });
     try {
-      await crearTicket(prog.ticket);
+      await crearDe(prog, crearTicket);
     } catch (e) {
       return res.status(502).json({ ok: false, error: String((e && e.message) || e) });
     }
@@ -401,5 +463,6 @@ module.exports = {
   _interno: {
     claveDePeriodo, claveSiVence, proximaEjecucion, validarProg,
     ejecutarVencidas, ahoraAR, aMinutos, authAdmin, authCron,
+    cifrarAutor, descifrarAutor,
   },
 };

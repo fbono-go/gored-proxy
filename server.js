@@ -1473,26 +1473,29 @@ async function ticketsDeProveedores(desdeIso) {
 montarPreventivo(app, { ticketsDeProveedores });
 
 // ── Tickets programados ─────────────────────────────────────────────────
-// Módulo aparte (programados.js). Los tickets automáticos se crean en el portal
-// con UN usuario fijo (variables de Render), porque nadie está con la app abierta
-// cuando salen. Las credenciales nunca se guardan en la hoja.
-// Requiere PROG_SHEETS_URL, PROG_TOKEN, CRON_SECRET, ADMIN_CLAVE,
-// PROG_PORTAL_EMAIL y PROG_PORTAL_PASS en las variables de Render.
-async function crearTicketProgramado(datos) {
-  const email = process.env.PROG_PORTAL_EMAIL;
-  const password = process.env.PROG_PORTAL_PASS;
-  if (!email || !password) throw new Error('Faltan PROG_PORTAL_EMAIL / PROG_PORTAL_PASS en Render');
-  let cookieHeader;
+// Módulo aparte (programados.js). Cada ticket automático se crea en el portal con
+// el usuario de quien lo programó; la contraseña se guarda cifrada.
+// Requiere PROG_SHEETS_URL, PROG_TOKEN, CRON_SECRET, ADMIN_CLAVE y PROG_CRYPT_KEY.
+// PROG_PORTAL_EMAIL / PROG_PORTAL_PASS quedan para las programaciones sin autor.
+async function verificarPortal(email, password) {
   try {
-    cookieHeader = await loginPortal(email, password);
+    return await loginPortal(email, password);
   } catch (e) {
-    throw new Error('No se pudo ingresar al portal: revisá PROG_PORTAL_EMAIL / PROG_PORTAL_PASS.');
+    throw new Error(e.message === 'PORTAL_LOGIN_FAILED'
+      ? `No se pudo ingresar al portal con ${email}: revisá email y contraseña.`
+      : 'El portal no respondió. Probá de nuevo en unos minutos.');
   }
-  const r = await crearTicketPortal(cookieHeader, datos, []);
+}
+
+async function crearTicketProgramado(datos, autor) {
+  const email = autor ? autor.email : process.env.PROG_PORTAL_EMAIL;
+  const password = autor ? autor.password : process.env.PROG_PORTAL_PASS;
+  if (!email || !password) throw new Error('Faltan PROG_PORTAL_EMAIL / PROG_PORTAL_PASS en Render');
+  const r = await crearTicketPortal(await verificarPortal(email, password), datos, []);
   if (!r.ok) throw new Error(r.motivo);
 }
 const { montarProgramados } = require('./programados');
-montarProgramados(app, { crearTicket: crearTicketProgramado });
+montarProgramados(app, { crearTicket: crearTicketProgramado, verificarPortal });
 
 const PORT = process.env.PORT || 3000;
 
